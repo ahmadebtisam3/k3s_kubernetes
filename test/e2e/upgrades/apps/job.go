@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package upgrades
+package apps
 
 import (
 	"context"
@@ -30,7 +30,7 @@ import (
 	e2ejob "k8s.io/kubernetes/test/e2e/framework/job"
 	"k8s.io/kubernetes/test/e2e/upgrades"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 )
 
 // JobUpgradeTest is a test harness for batch Jobs.

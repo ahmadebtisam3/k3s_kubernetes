@@ -28,14 +28,14 @@ source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::golang::setup_env
 
-go install k8s.io/kubernetes/vendor/k8s.io/code-generator/cmd/go-to-protobuf
-go install k8s.io/kubernetes/vendor/k8s.io/code-generator/cmd/go-to-protobuf/protoc-gen-gogo
+GO111MODULE=on GOPROXY=off go install k8s.io/code-generator/cmd/go-to-protobuf
+GO111MODULE=on GOPROXY=off go install k8s.io/code-generator/cmd/go-to-protobuf/protoc-gen-gogo
 
 if [[ -z "$(which protoc)" || "$(protoc --version)" != "libprotoc 3."* ]]; then
   echo "Generating protobuf requires protoc 3.0.0-beta1 or newer. Please download and"
   echo "install the platform appropriate Protobuf package for your OS: "
   echo
-  echo "  https://github.com/google/protobuf/releases"
+  echo "  https://github.com/protocolbuffers/protobuf/releases"
   echo
   echo "WARNING: Protobuf changes are not being validated"
   exit 1

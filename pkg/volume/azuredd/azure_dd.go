@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -131,6 +132,10 @@ func (plugin *azureDataDiskPlugin) SupportsMountOption() bool {
 
 func (plugin *azureDataDiskPlugin) SupportsBulkVolumeVerification() bool {
 	return false
+}
+
+func (plugin *azureDataDiskPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
 func (plugin *azureDataDiskPlugin) GetVolumeLimits() (map[string]int64, error) {

@@ -29,12 +29,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	restful "github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful/v3"
 
 	"k8s.io/apimachinery/pkg/types"
 	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/client-go/tools/remotecommand"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/portforward"
 	remotecommandserver "k8s.io/kubernetes/pkg/kubelet/cri/streaming/remotecommand"
 )
@@ -240,8 +240,10 @@ func (s *server) Start(stayUp bool) error {
 	if err != nil {
 		return err
 	}
-	// Use the actual address as baseURL host. This handles the "0" port case.
-	s.config.BaseURL.Host = listener.Addr().String()
+	if _, port, err := net.SplitHostPort(s.config.Addr); err != nil || port == "0" {
+		// Use the actual address as baseURL host. This handles the "0" port case.
+		s.config.BaseURL.Host = listener.Addr().String()
+	}
 	if s.config.TLSConfig != nil {
 		return s.server.ServeTLS(listener, "", "") // Use certs from TLSConfig.
 	}

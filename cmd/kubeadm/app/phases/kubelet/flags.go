@@ -18,7 +18,6 @@ package kubelet
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +25,7 @@ import (
 	"github.com/pkg/errors"
 
 	"k8s.io/klog/v2"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/images"
@@ -42,7 +42,7 @@ type kubeletFlagsOpts struct {
 // (from lower to higher):
 // - actual hostname
 // - NodeRegistrationOptions.Name (same as "--node-name" passed to "kubeadm init/join")
-// - "hostname-overide" flag in NodeRegistrationOptions.KubeletExtraArgs
+// - "hostname-override" flag in NodeRegistrationOptions.KubeletExtraArgs
 // It also returns the hostname or an error if getting the hostname failed.
 func GetNodeNameAndHostname(cfg *kubeadmapi.NodeRegistrationOptions) (string, string, error) {
 	hostname, err := kubeadmutil.GetHostname("")
@@ -71,20 +71,18 @@ func WriteKubeletDynamicEnvFile(cfg *kubeadmapi.ClusterConfiguration, nodeReg *k
 	return writeKubeletFlagBytesToDisk([]byte(envFileContent), kubeletDir)
 }
 
-//buildKubeletArgMapCommon takes a kubeletFlagsOpts object and builds based on that a string-string map with flags
-//that are common to both Linux and Windows
+// buildKubeletArgMapCommon takes a kubeletFlagsOpts object and builds based on that a string-string map with flags
+// that are common to both Linux and Windows
 func buildKubeletArgMapCommon(opts kubeletFlagsOpts) map[string]string {
 	kubeletFlags := map[string]string{}
+	kubeletFlags["container-runtime-endpoint"] = opts.nodeRegOpts.CRISocket
+	// container runtime is by default docker in kubelet v1.23, so it can be removed in v1.26
+	kubeletFlags["container-runtime"] = "remote"
 
-	if opts.nodeRegOpts.CRISocket == constants.DefaultDockerCRISocket {
-		// These flags should only be set when running docker
-		kubeletFlags["network-plugin"] = "cni"
-		if opts.pauseImage != "" {
-			kubeletFlags["pod-infra-container-image"] = opts.pauseImage
-		}
-	} else {
-		kubeletFlags["container-runtime"] = "remote"
-		kubeletFlags["container-runtime-endpoint"] = opts.nodeRegOpts.CRISocket
+	// This flag passes the pod infra container image (e.g. "pause" image) to the kubelet
+	// and prevents its garbage collection
+	if opts.pauseImage != "" {
+		kubeletFlags["pod-infra-container-image"] = opts.pauseImage
 	}
 
 	if opts.registerTaintsUsingFlags && opts.nodeRegOpts.Taints != nil && len(opts.nodeRegOpts.Taints) > 0 {
@@ -118,7 +116,7 @@ func writeKubeletFlagBytesToDisk(b []byte, kubeletDir string) error {
 	if err := os.MkdirAll(kubeletDir, 0700); err != nil {
 		return errors.Wrapf(err, "failed to create directory %q", kubeletDir)
 	}
-	if err := ioutil.WriteFile(kubeletEnvFilePath, b, 0644); err != nil {
+	if err := os.WriteFile(kubeletEnvFilePath, b, 0644); err != nil {
 		return errors.Wrapf(err, "failed to write kubelet configuration to the file %q", kubeletEnvFilePath)
 	}
 	return nil

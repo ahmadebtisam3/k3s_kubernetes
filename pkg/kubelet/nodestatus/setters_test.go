@@ -27,7 +27,7 @@ import (
 
 	cadvisorapiv1 "github.com/google/cadvisor/info/v1"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,6 +44,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/util/sliceutils"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	netutils "k8s.io/utils/net"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -55,18 +56,25 @@ const (
 
 // TODO(mtaufen): below is ported from the old kubelet_node_status_test.go code, potentially add more test coverage for NodeAddress setter in future
 func TestNodeAddress(t *testing.T) {
+	type cloudProviderType int
+	const (
+		cloudProviderLegacy cloudProviderType = iota
+		cloudProviderExternal
+		cloudProviderNone
+	)
 	cases := []struct {
-		name                  string
-		hostnameOverride      bool
-		nodeIP                net.IP
-		externalCloudProvider bool
-		nodeAddresses         []v1.NodeAddress
-		expectedAddresses     []v1.NodeAddress
-		shouldError           bool
+		name                string
+		hostnameOverride    bool
+		nodeIP              net.IP
+		cloudProviderType   cloudProviderType
+		nodeAddresses       []v1.NodeAddress
+		expectedAddresses   []v1.NodeAddress
+		expectedAnnotations map[string]string
+		shouldError         bool
 	}{
 		{
 			name:   "A single InternalIP",
-			nodeIP: net.ParseIP("10.1.1.1"),
+			nodeIP: netutils.ParseIPSloppy("10.1.1.1"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeHostName, Address: testKubeletHostname},
@@ -79,7 +87,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "NodeIP is external",
-			nodeIP: net.ParseIP("55.55.55.55"),
+			nodeIP: netutils.ParseIPSloppy("55.55.55.55"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeExternalIP, Address: "55.55.55.55"},
@@ -95,7 +103,7 @@ func TestNodeAddress(t *testing.T) {
 		{
 			// Accommodating #45201 and #49202
 			name:   "InternalIP and ExternalIP are the same",
-			nodeIP: net.ParseIP("55.55.55.55"),
+			nodeIP: netutils.ParseIPSloppy("55.55.55.55"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "44.44.44.44"},
 				{Type: v1.NodeExternalIP, Address: "44.44.44.44"},
@@ -112,7 +120,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "An Internal/ExternalIP, an Internal/ExternalDNS",
-			nodeIP: net.ParseIP("10.1.1.1"),
+			nodeIP: netutils.ParseIPSloppy("10.1.1.1"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeExternalIP, Address: "55.55.55.55"},
@@ -131,7 +139,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "An Internal with multiple internal IPs",
-			nodeIP: net.ParseIP("10.1.1.1"),
+			nodeIP: netutils.ParseIPSloppy("10.1.1.1"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeInternalIP, Address: "10.2.2.2"},
@@ -148,7 +156,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "An InternalIP that isn't valid: should error",
-			nodeIP: net.ParseIP("10.2.2.2"),
+			nodeIP: netutils.ParseIPSloppy("10.2.2.2"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeExternalIP, Address: "55.55.55.55"},
@@ -181,7 +189,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "cloud reports hostname, nodeIP is set, no override",
-			nodeIP: net.ParseIP("10.1.1.1"),
+			nodeIP: netutils.ParseIPSloppy("10.1.1.1"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeExternalIP, Address: "55.55.55.55"},
@@ -210,10 +218,10 @@ func TestNodeAddress(t *testing.T) {
 			shouldError:      false,
 		},
 		{
-			name:                  "cloud provider is external",
-			nodeIP:                net.ParseIP("10.0.0.1"),
-			nodeAddresses:         []v1.NodeAddress{},
-			externalCloudProvider: true,
+			name:              "cloud provider is external",
+			nodeIP:            netutils.ParseIPSloppy("10.0.0.1"),
+			nodeAddresses:     []v1.NodeAddress{},
+			cloudProviderType: cloudProviderExternal,
 			expectedAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
 				{Type: v1.NodeHostName, Address: testKubeletHostname},
@@ -250,7 +258,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "cloud doesn't report hostname, nodeIP is set, no override, detected hostname match",
-			nodeIP: net.ParseIP("10.1.1.1"),
+			nodeIP: netutils.ParseIPSloppy("10.1.1.1"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeExternalIP, Address: "55.55.55.55"},
@@ -266,7 +274,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "cloud doesn't report hostname, nodeIP is set, no override, detected hostname match with same type as nodeIP",
-			nodeIP: net.ParseIP("10.1.1.1"),
+			nodeIP: netutils.ParseIPSloppy("10.1.1.1"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeInternalIP, Address: testKubeletHostname}, // cloud-reported address value matches detected hostname
@@ -292,6 +300,20 @@ func TestNodeAddress(t *testing.T) {
 			},
 			hostnameOverride: true,
 			shouldError:      false,
+		},
+		{
+			name:   "Dual-stack cloud, with nodeIP, different IPv6 formats",
+			nodeIP: netutils.ParseIPSloppy("2600:1f14:1d4:d101::ba3d"),
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeInternalIP, Address: "2600:1f14:1d4:d101:0:0:0:ba3d"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "2600:1f14:1d4:d101:0:0:0:ba3d"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			shouldError: false,
 		},
 		{
 			name: "Dual-stack cloud, IPv4 first, no nodeIP",
@@ -323,7 +345,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "Dual-stack cloud, IPv4 first, request IPv4",
-			nodeIP: net.ParseIP("0.0.0.0"),
+			nodeIP: netutils.ParseIPSloppy("0.0.0.0"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeInternalIP, Address: "fc01:1234::5678"},
@@ -338,7 +360,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "Dual-stack cloud, IPv6 first, request IPv4",
-			nodeIP: net.ParseIP("0.0.0.0"),
+			nodeIP: netutils.ParseIPSloppy("0.0.0.0"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "fc01:1234::5678"},
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
@@ -353,7 +375,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "Dual-stack cloud, IPv4 first, request IPv6",
-			nodeIP: net.ParseIP("::"),
+			nodeIP: netutils.ParseIPSloppy("::"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeInternalIP, Address: "fc01:1234::5678"},
@@ -368,7 +390,7 @@ func TestNodeAddress(t *testing.T) {
 		},
 		{
 			name:   "Dual-stack cloud, IPv6 first, request IPv6",
-			nodeIP: net.ParseIP("::"),
+			nodeIP: netutils.ParseIPSloppy("::"),
 			nodeAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "fc01:1234::5678"},
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
@@ -380,6 +402,55 @@ func TestNodeAddress(t *testing.T) {
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 			},
 			shouldError: false,
+		},
+		{
+			name:              "Legacy cloud provider gets nodeIP annotation",
+			nodeIP:            netutils.ParseIPSloppy("10.1.1.1"),
+			cloudProviderType: cloudProviderLegacy,
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAnnotations: map[string]string{
+				"alpha.kubernetes.io/provided-node-ip": "10.1.1.1",
+			},
+			shouldError: false,
+		},
+		{
+			name:              "External cloud provider gets nodeIP annotation",
+			nodeIP:            netutils.ParseIPSloppy("10.1.1.1"),
+			cloudProviderType: cloudProviderExternal,
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAnnotations: map[string]string{
+				"alpha.kubernetes.io/provided-node-ip": "10.1.1.1",
+			},
+			shouldError: false,
+		},
+		{
+			name:              "No cloud provider does not get nodeIP annotation",
+			nodeIP:            netutils.ParseIPSloppy("10.1.1.1"),
+			cloudProviderType: cloudProviderNone,
+			nodeAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAddresses: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
+				{Type: v1.NodeHostName, Address: testKubeletHostname},
+			},
+			expectedAnnotations: map[string]string{},
+			shouldError:         false,
 		},
 	}
 	for _, testCase := range cases {
@@ -403,16 +474,13 @@ func TestNodeAddress(t *testing.T) {
 				return testCase.nodeAddresses, nil
 			}
 
-			// cloud provider is expected to be nil if external provider is set
+			// cloud provider is expected to be nil if external provider is set or there is no cloud provider
 			var cloud cloudprovider.Interface
-			if testCase.externalCloudProvider {
-				cloud = nil
-			} else {
+			if testCase.cloudProviderType == cloudProviderLegacy {
 				cloud = &fakecloud.Cloud{
 					Addresses: testCase.nodeAddresses,
 					Err:       nil,
 				}
-
 			}
 
 			// construct setter
@@ -420,7 +488,7 @@ func TestNodeAddress(t *testing.T) {
 				nodeIPValidator,
 				hostname,
 				testCase.hostnameOverride,
-				testCase.externalCloudProvider,
+				testCase.cloudProviderType == cloudProviderExternal,
 				cloud,
 				nodeAddressesFunc)
 
@@ -435,6 +503,10 @@ func TestNodeAddress(t *testing.T) {
 
 			assert.True(t, apiequality.Semantic.DeepEqual(testCase.expectedAddresses, existingNode.Status.Addresses),
 				"Diff: %s", diff.ObjectDiff(testCase.expectedAddresses, existingNode.Status.Addresses))
+			if testCase.expectedAnnotations != nil {
+				assert.True(t, apiequality.Semantic.DeepEqual(testCase.expectedAnnotations, existingNode.Annotations),
+					"Diff: %s", diff.ObjectDiff(testCase.expectedAnnotations, existingNode.Annotations))
+			}
 		})
 	}
 }
@@ -448,7 +520,7 @@ func TestNodeAddress_NoCloudProvider(t *testing.T) {
 	}{
 		{
 			name:    "Single --node-ip",
-			nodeIPs: []net.IP{net.ParseIP("10.1.1.1")},
+			nodeIPs: []net.IP{netutils.ParseIPSloppy("10.1.1.1")},
 			expectedAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeHostName, Address: testKubeletHostname},
@@ -456,7 +528,7 @@ func TestNodeAddress_NoCloudProvider(t *testing.T) {
 		},
 		{
 			name:    "Dual --node-ips",
-			nodeIPs: []net.IP{net.ParseIP("10.1.1.1"), net.ParseIP("fd01::1234")},
+			nodeIPs: []net.IP{netutils.ParseIPSloppy("10.1.1.1"), netutils.ParseIPSloppy("fd01::1234")},
 			expectedAddresses: []v1.NodeAddress{
 				{Type: v1.NodeInternalIP, Address: "10.1.1.1"},
 				{Type: v1.NodeInternalIP, Address: "fd01::1234"},
@@ -513,17 +585,18 @@ func TestMachineInfo(t *testing.T) {
 	}
 
 	cases := []struct {
-		desc                         string
-		node                         *v1.Node
-		maxPods                      int
-		podsPerCore                  int
-		machineInfo                  *cadvisorapiv1.MachineInfo
-		machineInfoError             error
-		capacity                     v1.ResourceList
-		devicePluginResourceCapacity dprc
-		nodeAllocatableReservation   v1.ResourceList
-		expectNode                   *v1.Node
-		expectEvents                 []testEvent
+		desc                                 string
+		node                                 *v1.Node
+		maxPods                              int
+		podsPerCore                          int
+		machineInfo                          *cadvisorapiv1.MachineInfo
+		machineInfoError                     error
+		capacity                             v1.ResourceList
+		devicePluginResourceCapacity         dprc
+		nodeAllocatableReservation           v1.ResourceList
+		expectNode                           *v1.Node
+		expectEvents                         []testEvent
+		disableLocalStorageCapacityIsolation bool
 	}{
 		{
 			desc:    "machine identifiers, basic capacity and allocatable",
@@ -726,6 +799,35 @@ func TestMachineInfo(t *testing.T) {
 			},
 		},
 		{
+			desc:    "ephemeral storage is not reflected in capacity and allocatable because localStorageCapacityIsolation is disabled",
+			node:    &v1.Node{},
+			maxPods: 110,
+			machineInfo: &cadvisorapiv1.MachineInfo{
+				NumCores:       2,
+				MemoryCapacity: 1024,
+			},
+			capacity: v1.ResourceList{
+				v1.ResourceEphemeralStorage: *resource.NewQuantity(5000, resource.BinarySI),
+			},
+			expectNode: &v1.Node{
+				Status: v1.NodeStatus{
+					Capacity: v1.ResourceList{
+						v1.ResourceCPU:              *resource.NewMilliQuantity(2000, resource.DecimalSI),
+						v1.ResourceMemory:           *resource.NewQuantity(1024, resource.BinarySI),
+						v1.ResourcePods:             *resource.NewQuantity(110, resource.DecimalSI),
+						v1.ResourceEphemeralStorage: *resource.NewQuantity(5000, resource.BinarySI),
+					},
+					Allocatable: v1.ResourceList{
+						v1.ResourceCPU:              *resource.NewMilliQuantity(2000, resource.DecimalSI),
+						v1.ResourceMemory:           *resource.NewQuantity(1024, resource.BinarySI),
+						v1.ResourcePods:             *resource.NewQuantity(110, resource.DecimalSI),
+						v1.ResourceEphemeralStorage: *resource.NewQuantity(5000, resource.BinarySI),
+					},
+				},
+			},
+			disableLocalStorageCapacityIsolation: true,
+		},
+		{
 			desc:    "device plugin resources are reflected in capacity and allocatable",
 			node:    &v1.Node{},
 			maxPods: 110,
@@ -890,7 +992,7 @@ func TestMachineInfo(t *testing.T) {
 			machineInfoFunc := func() (*cadvisorapiv1.MachineInfo, error) {
 				return tc.machineInfo, tc.machineInfoError
 			}
-			capacityFunc := func() v1.ResourceList {
+			capacityFunc := func(localStorageCapacityIsolation bool) v1.ResourceList {
 				return tc.capacity
 			}
 			devicePluginResourceCapacityFunc := func() (v1.ResourceList, v1.ResourceList, []string) {
@@ -911,7 +1013,7 @@ func TestMachineInfo(t *testing.T) {
 			}
 			// construct setter
 			setter := MachineInfo(nodeName, tc.maxPods, tc.podsPerCore, machineInfoFunc, capacityFunc,
-				devicePluginResourceCapacityFunc, nodeAllocatableReservationFunc, recordEventFunc)
+				devicePluginResourceCapacityFunc, nodeAllocatableReservationFunc, recordEventFunc, tc.disableLocalStorageCapacityIsolation)
 			// call setter on node
 			if err := setter(tc.node); err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -1108,17 +1210,28 @@ func TestReadyCondition(t *testing.T) {
 		},
 	}
 
+	withoutStorageCapacity := &v1.Node{
+		Status: v1.NodeStatus{
+			Capacity: v1.ResourceList{
+				v1.ResourceCPU:    *resource.NewMilliQuantity(2000, resource.DecimalSI),
+				v1.ResourceMemory: *resource.NewQuantity(10e9, resource.BinarySI),
+				v1.ResourcePods:   *resource.NewQuantity(100, resource.DecimalSI),
+			},
+		},
+	}
+
 	cases := []struct {
-		desc                      string
-		node                      *v1.Node
-		runtimeErrors             error
-		networkErrors             error
-		storageErrors             error
-		appArmorValidateHostFunc  func() error
-		cmStatus                  cm.Status
-		nodeShutdownManagerErrors error
-		expectConditions          []v1.NodeCondition
-		expectEvents              []testEvent
+		desc                                 string
+		node                                 *v1.Node
+		runtimeErrors                        error
+		networkErrors                        error
+		storageErrors                        error
+		appArmorValidateHostFunc             func() error
+		cmStatus                             cm.Status
+		nodeShutdownManagerErrors            error
+		expectConditions                     []v1.NodeCondition
+		expectEvents                         []testEvent
+		disableLocalStorageCapacityIsolation bool
 	}{
 		{
 			desc:             "new, ready",
@@ -1172,6 +1285,12 @@ func TestReadyCondition(t *testing.T) {
 			desc:             "new, not ready: missing capacities",
 			node:             &v1.Node{},
 			expectConditions: []v1.NodeCondition{*makeReadyCondition(false, "missing node capacity for resources: cpu, memory, pods, ephemeral-storage", now, now)},
+		},
+		{
+			desc:                                 "new, ready: localStorageCapacityIsolation is not supported",
+			node:                                 withoutStorageCapacity.DeepCopy(),
+			disableLocalStorageCapacityIsolation: true,
+			expectConditions:                     []v1.NodeCondition{*makeReadyCondition(true, "kubelet is posting ready status", now, now)},
 		},
 		// the transition tests ensure timestamps are set correctly, no need to test the entire condition matrix in this section
 		{
@@ -1252,7 +1371,7 @@ func TestReadyCondition(t *testing.T) {
 				})
 			}
 			// construct setter
-			setter := ReadyCondition(nowFunc, runtimeErrorsFunc, networkErrorsFunc, storageErrorsFunc, tc.appArmorValidateHostFunc, cmStatusFunc, nodeShutdownErrorsFunc, recordEventFunc)
+			setter := ReadyCondition(nowFunc, runtimeErrorsFunc, networkErrorsFunc, storageErrorsFunc, tc.appArmorValidateHostFunc, cmStatusFunc, nodeShutdownErrorsFunc, recordEventFunc, !tc.disableLocalStorageCapacityIsolation)
 			// call setter on node
 			if err := setter(tc.node); err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -1796,7 +1915,7 @@ func makeExpectedImageList(imageList []kubecontainer.Image, maxImages, maxNames 
 func makeImageTags(num int32) []string {
 	tags := make([]string, num)
 	for i := range tags {
-		tags[i] = "k8s.gcr.io:v" + strconv.Itoa(i)
+		tags[i] = "registry.k8s.io:v" + strconv.Itoa(i)
 	}
 	return tags
 }

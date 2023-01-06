@@ -17,17 +17,23 @@ limitations under the License.
 package kubelet
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	core "k8s.io/client-go/testing"
 	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
@@ -35,13 +41,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2/ktesting"
 	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/pkg/kubelet/config"
@@ -53,6 +59,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/logs"
 	"k8s.io/kubernetes/pkg/kubelet/network/dns"
+	"k8s.io/kubernetes/pkg/kubelet/nodeshutdown"
 	"k8s.io/kubernetes/pkg/kubelet/pleg"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager"
 	kubepod "k8s.io/kubernetes/pkg/kubelet/pod"
@@ -78,10 +85,11 @@ import (
 	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	"k8s.io/kubernetes/pkg/volume/util/subpath"
+	"k8s.io/utils/clock"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func init() {
-	utilruntime.ReallyCrash = true
 }
 
 const (
@@ -106,18 +114,20 @@ func (f *fakeImageGCManager) GetImageList() ([]kubecontainer.Image, error) {
 }
 
 type TestKubelet struct {
-	kubelet          *Kubelet
-	fakeRuntime      *containertest.FakeRuntime
-	fakeKubeClient   *fake.Clientset
-	fakeMirrorClient *podtest.FakeMirrorClient
-	fakeClock        *clock.FakeClock
-	mounter          mount.Interface
-	volumePlugin     *volumetest.FakeVolumePlugin
+	kubelet              *Kubelet
+	fakeRuntime          *containertest.FakeRuntime
+	fakeContainerManager *cm.FakeContainerManager
+	fakeKubeClient       *fake.Clientset
+	fakeMirrorClient     *podtest.FakeMirrorClient
+	fakeClock            *testingclock.FakeClock
+	mounter              mount.Interface
+	volumePlugin         *volumetest.FakeVolumePlugin
 }
 
 func (tk *TestKubelet) Cleanup() {
 	if tk.kubelet != nil {
 		os.RemoveAll(tk.kubelet.rootDirectory)
+		tk.kubelet = nil
 	}
 }
 
@@ -126,33 +136,39 @@ func newTestKubelet(t *testing.T, controllerAttachDetachEnabled bool) *TestKubel
 	imageList := []kubecontainer.Image{
 		{
 			ID:       "abc",
-			RepoTags: []string{"k8s.gcr.io:v1", "k8s.gcr.io:v2"},
+			RepoTags: []string{"registry.k8s.io:v1", "registry.k8s.io:v2"},
 			Size:     123,
 		},
 		{
 			ID:       "efg",
-			RepoTags: []string{"k8s.gcr.io:v3", "k8s.gcr.io:v4"},
+			RepoTags: []string{"registry.k8s.io:v3", "registry.k8s.io:v4"},
 			Size:     456,
 		},
 	}
-	return newTestKubeletWithImageList(t, imageList, controllerAttachDetachEnabled, true /*initFakeVolumePlugin*/)
+	return newTestKubeletWithImageList(t, imageList, controllerAttachDetachEnabled, true /*initFakeVolumePlugin*/, true /*localStorageCapacityIsolation*/)
 }
 
 func newTestKubeletWithImageList(
 	t *testing.T,
 	imageList []kubecontainer.Image,
 	controllerAttachDetachEnabled bool,
-	initFakeVolumePlugin bool) *TestKubelet {
-	fakeRuntime := &containertest.FakeRuntime{}
-	fakeRuntime.RuntimeType = "test"
-	fakeRuntime.VersionInfo = "1.5.0"
-	fakeRuntime.ImageList = imageList
-	// Set ready conditions by default.
-	fakeRuntime.RuntimeStatus = &kubecontainer.RuntimeStatus{
-		Conditions: []kubecontainer.RuntimeCondition{
-			{Type: "RuntimeReady", Status: true},
-			{Type: "NetworkReady", Status: true},
+	initFakeVolumePlugin bool,
+	localStorageCapacityIsolation bool,
+) *TestKubelet {
+	logger, _ := ktesting.NewTestContext(t)
+
+	fakeRuntime := &containertest.FakeRuntime{
+		ImageList: imageList,
+		// Set ready conditions by default.
+		RuntimeStatus: &kubecontainer.RuntimeStatus{
+			Conditions: []kubecontainer.RuntimeCondition{
+				{Type: "RuntimeReady", Status: true},
+				{Type: "NetworkReady", Status: true},
+			},
 		},
+		VersionInfo: "1.5.0",
+		RuntimeType: "test",
+		T:           t,
 	}
 
 	fakeRecorder := &record.FakeRecorder{}
@@ -182,6 +198,7 @@ func newTestKubeletWithImageList(
 	kubelet.masterServiceNamespace = metav1.NamespaceDefault
 	kubelet.serviceLister = testServiceLister{}
 	kubelet.serviceHasSynced = func() bool { return true }
+	kubelet.nodeHasSynced = func() bool { return true }
 	kubelet.nodeLister = testNodeLister{
 		nodes: []*v1.Node{
 			{
@@ -201,6 +218,12 @@ func newTestKubeletWithImageList(
 						{
 							Type:    v1.NodeInternalIP,
 							Address: testKubeletHostIP,
+						},
+					},
+					VolumesAttached: []v1.AttachedVolume{
+						{
+							Name:       "fake/fake-device",
+							DevicePath: "fake/path",
 						},
 					},
 				},
@@ -237,9 +260,11 @@ func newTestKubeletWithImageList(
 
 	kubelet.probeManager = probetest.FakeManager{}
 	kubelet.livenessManager = proberesults.NewManager()
+	kubelet.readinessManager = proberesults.NewManager()
 	kubelet.startupManager = proberesults.NewManager()
 
-	kubelet.containerManager = cm.NewStubContainerManager()
+	fakeContainerManager := cm.NewFakeContainerManager()
+	kubelet.containerManager = fakeContainerManager
 	fakeNodeRef := &v1.ObjectReference{
 		Kind:      "Node",
 		Name:      testKubeletHostname,
@@ -248,7 +273,9 @@ func newTestKubeletWithImageList(
 	}
 
 	volumeStatsAggPeriod := time.Second * 10
-	kubelet.resourceAnalyzer = serverstats.NewResourceAnalyzer(kubelet, volumeStatsAggPeriod)
+	kubelet.resourceAnalyzer = serverstats.NewResourceAnalyzer(kubelet, volumeStatsAggPeriod, kubelet.recorder)
+
+	fakeHostStatsProvider := stats.NewFakeHostStatsProvider()
 
 	kubelet.StatsProvider = stats.NewCadvisorStatsProvider(
 		kubelet.cadvisor,
@@ -256,7 +283,9 @@ func newTestKubeletWithImageList(
 		kubelet.podManager,
 		kubelet.runtimeCache,
 		fakeRuntime,
-		kubelet.statusManager)
+		kubelet.statusManager,
+		fakeHostStatsProvider,
+	)
 	fakeImageGCPolicy := images.ImageGCPolicy{
 		HighThresholdPercent: 90,
 		LowThresholdPercent:  80,
@@ -277,14 +306,13 @@ func newTestKubeletWithImageList(
 	assert.NoError(t, err)
 	kubelet.containerGC = containerGC
 
-	fakeClock := clock.NewFakeClock(time.Now())
+	fakeClock := testingclock.NewFakeClock(time.Now())
 	kubelet.backOff = flowcontrol.NewBackOff(time.Second, time.Minute)
 	kubelet.backOff.Clock = fakeClock
-	kubelet.podKiller = NewPodKiller(kubelet)
 	kubelet.resyncInterval = 10 * time.Second
 	kubelet.workQueue = queue.NewBasicWorkQueue(fakeClock)
 	// Relist period does not affect the tests.
-	kubelet.pleg = pleg.NewGenericPLEG(fakeRuntime, 100, time.Hour, nil, clock.RealClock{})
+	kubelet.pleg = pleg.NewGenericPLEG(fakeRuntime, 100, time.Hour, kubelet.podCache, clock.RealClock{})
 	kubelet.clock = fakeClock
 
 	nodeRef := &v1.ObjectReference{
@@ -293,12 +321,28 @@ func newTestKubeletWithImageList(
 		UID:       types.UID(kubelet.nodeName),
 		Namespace: "",
 	}
-	etcHostsPathFunc := func(podUID types.UID) string { return getEtcHostsPath(kubelet.getPodDir(podUID)) }
 	// setup eviction manager
-	evictionManager, evictionAdmitHandler := eviction.NewManager(kubelet.resourceAnalyzer, eviction.Config{}, killPodNow(kubelet.podWorkers, fakeRecorder), kubelet.podManager.GetMirrorPodByPod, kubelet.imageManager, kubelet.containerGC, fakeRecorder, nodeRef, kubelet.clock, etcHostsPathFunc)
+	evictionManager, evictionAdmitHandler := eviction.NewManager(kubelet.resourceAnalyzer, eviction.Config{},
+		killPodNow(kubelet.podWorkers, fakeRecorder), kubelet.podManager.GetMirrorPodByPod, kubelet.imageManager, kubelet.containerGC, fakeRecorder, nodeRef, kubelet.clock, kubelet.supportLocalStorageCapacityIsolation())
 
 	kubelet.evictionManager = evictionManager
 	kubelet.admitHandlers.AddPodAdmitHandler(evictionAdmitHandler)
+
+	// setup shutdown manager
+	shutdownManager, shutdownAdmitHandler := nodeshutdown.NewManager(&nodeshutdown.Config{
+		Logger:                          logger,
+		ProbeManager:                    kubelet.probeManager,
+		Recorder:                        fakeRecorder,
+		NodeRef:                         nodeRef,
+		GetPodsFunc:                     kubelet.podManager.GetPods,
+		KillPodFunc:                     killPodNow(kubelet.podWorkers, fakeRecorder),
+		SyncNodeStatusFunc:              func() {},
+		ShutdownGracePeriodRequested:    0,
+		ShutdownGracePeriodCriticalPods: 0,
+	})
+	kubelet.shutdownManager = shutdownManager
+	kubelet.admitHandlers.AddPodAdmitHandler(shutdownAdmitHandler)
+
 	// Add this as cleanup predicate pod admitter
 	kubelet.admitHandlers.AddPodAdmitHandler(lifecycle.NewPredicateAdmitHandler(kubelet.getNodeAnyWay, lifecycle.NewAdmissionFailureHandlerStub(), kubelet.containerManager.UpdatePluginResources))
 
@@ -321,7 +365,7 @@ func newTestKubeletWithImageList(
 		controllerAttachDetachEnabled,
 		kubelet.nodeName,
 		kubelet.podManager,
-		kubelet.statusManager,
+		kubelet.podWorkers,
 		fakeKubeClient,
 		kubelet.volumePluginMgr,
 		fakeRuntime,
@@ -329,7 +373,6 @@ func newTestKubeletWithImageList(
 		kubelet.hostutil,
 		kubelet.getPodsDir(),
 		kubelet.recorder,
-		false, /* experimentalCheckNodeCapabilitiesBeforeMount*/
 		false, /* keepTerminatedPodVolumes */
 		volumetest.NewBlockVolumePathHandler())
 
@@ -345,7 +388,9 @@ func newTestKubeletWithImageList(
 
 	kubelet.AddPodSyncLoopHandler(activeDeadlineHandler)
 	kubelet.AddPodSyncHandler(activeDeadlineHandler)
-	return &TestKubelet{kubelet, fakeRuntime, fakeKubeClient, fakeMirrorClient, fakeClock, nil, plug}
+	kubelet.lastContainerStartedTime = newTimeCache()
+	kubelet.kubeletConfiguration.LocalStorageCapacityIsolation = localStorageCapacityIsolation
+	return &TestKubelet{kubelet, fakeRuntime, fakeContainerManager, fakeKubeClient, fakeMirrorClient, fakeClock, nil, plug}
 }
 
 func newTestPods(count int) []*v1.Pod {
@@ -401,34 +446,277 @@ func TestSyncPodsStartPod(t *testing.T) {
 	fakeRuntime.AssertStartedPods([]string{string(pods[0].UID)})
 }
 
-func TestSyncPodsDeletesWhenSourcesAreReady(t *testing.T) {
+func TestHandlePodCleanupsPerQOS(t *testing.T) {
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+
+	pod := &kubecontainer.Pod{
+		ID:        "12345678",
+		Name:      "foo",
+		Namespace: "new",
+		Containers: []*kubecontainer.Container{
+			{Name: "bar"},
+		},
+	}
+
+	fakeRuntime := testKubelet.fakeRuntime
+	fakeContainerManager := testKubelet.fakeContainerManager
+	fakeContainerManager.PodContainerManager.AddPodFromCgroups(pod) // add pod to mock cgroup
+	fakeRuntime.PodList = []*containertest.FakePod{
+		{Pod: pod},
+	}
+	kubelet := testKubelet.kubelet
+	kubelet.cgroupsPerQOS = true // enable cgroupsPerQOS to turn on the cgroups cleanup
+
+	// HandlePodCleanups gets called every 2 seconds within the Kubelet's
+	// housekeeping routine. This test registers the pod, removes the unwanted pod, then calls into
+	// HandlePodCleanups a few more times. We should only see one Destroy() event. podKiller runs
+	// within a goroutine so a two second delay should be enough time to
+	// mark the pod as killed (within this test case).
+
+	kubelet.HandlePodCleanups()
+
+	// assert that unwanted pods were killed
+	if actual, expected := kubelet.podWorkers.(*fakePodWorkers).triggeredDeletion, []types.UID{"12345678"}; !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("expected %v to be deleted, got %v", expected, actual)
+	}
+	fakeRuntime.AssertKilledPods([]string(nil))
+
+	// simulate Runtime.KillPod
+	fakeRuntime.PodList = nil
+
+	kubelet.HandlePodCleanups()
+	kubelet.HandlePodCleanups()
+	kubelet.HandlePodCleanups()
+
+	destroyCount := 0
+	err := wait.Poll(100*time.Millisecond, 10*time.Second, func() (bool, error) {
+		fakeContainerManager.PodContainerManager.Lock()
+		defer fakeContainerManager.PodContainerManager.Unlock()
+		destroyCount = 0
+		for _, functionName := range fakeContainerManager.PodContainerManager.CalledFunctions {
+			if functionName == "Destroy" {
+				destroyCount = destroyCount + 1
+			}
+		}
+		return destroyCount >= 1, nil
+	})
+
+	assert.NoError(t, err, "wait should not return error")
+	// housekeeping can get called multiple times. The cgroup Destroy() is
+	// done within a goroutine and can get called multiple times, so the
+	// Destroy() count in not deterministic on the actual number.
+	// https://github.com/kubernetes/kubernetes/blob/29fdbb065b5e0d195299eb2d260b975cbc554673/pkg/kubelet/kubelet_pods.go#L2006
+	assert.True(t, destroyCount >= 1, "Expect 1 or more destroys")
+}
+
+func TestDispatchWorkOfCompletedPod(t *testing.T) {
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+	kubelet := testKubelet.kubelet
+	var got bool
+	kubelet.podWorkers = &fakePodWorkers{
+		syncPodFn: func(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
+			got = true
+			return false, nil
+		},
+		cache: kubelet.podCache,
+		t:     t,
+	}
+	now := metav1.NewTime(time.Now())
+	pods := []*v1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "1",
+				Name:        "completed-pod1",
+				Namespace:   "ns",
+				Annotations: make(map[string]string),
+			},
+			Status: v1.PodStatus{
+				Phase: v1.PodFailed,
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						State: v1.ContainerState{
+							Terminated: &v1.ContainerStateTerminated{},
+						},
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "2",
+				Name:        "completed-pod2",
+				Namespace:   "ns",
+				Annotations: make(map[string]string),
+			},
+			Status: v1.PodStatus{
+				Phase: v1.PodSucceeded,
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						State: v1.ContainerState{
+							Terminated: &v1.ContainerStateTerminated{},
+						},
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:               "3",
+				Name:              "completed-pod3",
+				Namespace:         "ns",
+				Annotations:       make(map[string]string),
+				DeletionTimestamp: &now,
+			},
+			Status: v1.PodStatus{
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						State: v1.ContainerState{
+							Terminated: &v1.ContainerStateTerminated{},
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, pod := range pods {
+		kubelet.dispatchWork(pod, kubetypes.SyncPodSync, nil, time.Now())
+		if !got {
+			t.Errorf("Should not skip completed pod %q", pod.Name)
+		}
+		got = false
+	}
+}
+
+func TestDispatchWorkOfActivePod(t *testing.T) {
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+	kubelet := testKubelet.kubelet
+	var got bool
+	kubelet.podWorkers = &fakePodWorkers{
+		syncPodFn: func(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
+			got = true
+			return false, nil
+		},
+		cache: kubelet.podCache,
+		t:     t,
+	}
+	pods := []*v1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "1",
+				Name:        "active-pod1",
+				Namespace:   "ns",
+				Annotations: make(map[string]string),
+			},
+			Status: v1.PodStatus{
+				Phase: v1.PodRunning,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "2",
+				Name:        "active-pod2",
+				Namespace:   "ns",
+				Annotations: make(map[string]string),
+			},
+			Status: v1.PodStatus{
+				Phase: v1.PodFailed,
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, pod := range pods {
+		kubelet.dispatchWork(pod, kubetypes.SyncPodSync, nil, time.Now())
+		if !got {
+			t.Errorf("Should not skip active pod %q", pod.Name)
+		}
+		got = false
+	}
+}
+
+func TestHandlePodCleanups(t *testing.T) {
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+
+	pod := &kubecontainer.Pod{
+		ID:        "12345678",
+		Name:      "foo",
+		Namespace: "new",
+		Containers: []*kubecontainer.Container{
+			{Name: "bar"},
+		},
+	}
+
+	fakeRuntime := testKubelet.fakeRuntime
+	fakeRuntime.PodList = []*containertest.FakePod{
+		{Pod: pod},
+	}
+	kubelet := testKubelet.kubelet
+
+	kubelet.HandlePodCleanups()
+
+	// assert that unwanted pods were queued to kill
+	if actual, expected := kubelet.podWorkers.(*fakePodWorkers).triggeredDeletion, []types.UID{"12345678"}; !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("expected %v to be deleted, got %v", expected, actual)
+	}
+	fakeRuntime.AssertKilledPods([]string(nil))
+}
+
+func TestHandlePodRemovesWhenSourcesAreReady(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
 	ready := false
 
 	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
 	defer testKubelet.Cleanup()
+
+	fakePod := &kubecontainer.Pod{
+		ID:        "1",
+		Name:      "foo",
+		Namespace: "new",
+		Containers: []*kubecontainer.Container{
+			{Name: "bar"},
+		},
+	}
+
+	pods := []*v1.Pod{
+		podWithUIDNameNs("1", "foo", "new"),
+	}
+
 	fakeRuntime := testKubelet.fakeRuntime
+	fakeRuntime.PodList = []*containertest.FakePod{
+		{Pod: fakePod},
+	}
 	kubelet := testKubelet.kubelet
 	kubelet.sourcesReady = config.NewSourcesReady(func(_ sets.String) bool { return ready })
 
-	fakeRuntime.PodList = []*containertest.FakePod{
-		{Pod: &kubecontainer.Pod{
-			ID:        "12345678",
-			Name:      "foo",
-			Namespace: "new",
-			Containers: []*kubecontainer.Container{
-				{Name: "bar"},
-			},
-		}},
-	}
-	kubelet.HandlePodCleanups()
+	kubelet.HandlePodRemoves(pods)
+	time.Sleep(2 * time.Second)
+
 	// Sources are not ready yet. Don't remove any pods.
-	fakeRuntime.AssertKilledPods([]string{})
+	if expect, actual := []types.UID(nil), kubelet.podWorkers.(*fakePodWorkers).triggeredDeletion; !reflect.DeepEqual(expect, actual) {
+		t.Fatalf("expected %v kills, got %v", expect, actual)
+	}
 
 	ready = true
-	kubelet.HandlePodCleanups()
+	kubelet.HandlePodRemoves(pods)
+	time.Sleep(2 * time.Second)
 
 	// Sources are ready. Remove unwanted pods.
-	fakeRuntime.AssertKilledPods([]string{"12345678"})
+	if expect, actual := []types.UID{"1"}, kubelet.podWorkers.(*fakePodWorkers).triggeredDeletion; !reflect.DeepEqual(expect, actual) {
+		t.Fatalf("expected %v kills, got %v", expect, actual)
+	}
 }
 
 type testNodeLister struct {
@@ -449,6 +737,7 @@ func (nl testNodeLister) List(_ labels.Selector) (ret []*v1.Node, err error) {
 }
 
 func checkPodStatus(t *testing.T, kl *Kubelet, pod *v1.Pod, phase v1.PodPhase) {
+	t.Helper()
 	status, found := kl.statusManager.GetPodStatus(pod.UID)
 	require.True(t, found, "Status of pod %q is not found in the status map", pod.UID)
 	require.Equal(t, phase, status.Phase)
@@ -474,7 +763,7 @@ func TestHandlePortConflicts(t *testing.T) {
 	recorder := record.NewFakeRecorder(20)
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
-		Name:      string("testNode"),
+		Name:      "testNode",
 		UID:       types.UID("testNode"),
 		Namespace: "",
 	}
@@ -492,6 +781,10 @@ func TestHandlePortConflicts(t *testing.T) {
 	// The newer pod should be rejected.
 	notfittingPod := pods[0]
 	fittingPod := pods[1]
+	kl.podWorkers.(*fakePodWorkers).running = map[types.UID]bool{
+		pods[0].UID: true,
+		pods[1].UID: true,
+	}
 
 	kl.HandlePodAdditions(pods)
 
@@ -520,7 +813,7 @@ func TestHandleHostNameConflicts(t *testing.T) {
 	recorder := record.NewFakeRecorder(20)
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
-		Name:      string("testNode"),
+		Name:      "testNode",
 		UID:       types.UID("testNode"),
 		Namespace: "",
 	}
@@ -563,7 +856,7 @@ func TestHandleNodeSelector(t *testing.T) {
 	recorder := record.NewFakeRecorder(20)
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
-		Name:      string("testNode"),
+		Name:      "testNode",
 		UID:       types.UID("testNode"),
 		Namespace: "",
 	}
@@ -585,6 +878,71 @@ func TestHandleNodeSelector(t *testing.T) {
 	checkPodStatus(t, kl, fittingPod, v1.PodPending)
 }
 
+// Tests that we handle not matching labels selector correctly by setting the failed status in status map.
+func TestHandleNodeSelectorBasedOnOS(t *testing.T) {
+	tests := []struct {
+		name        string
+		nodeLabels  map[string]string
+		podSelector map[string]string
+		podStatus   v1.PodPhase
+	}{
+		{
+			name:        "correct OS label, wrong pod selector, admission denied",
+			nodeLabels:  map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH},
+			podSelector: map[string]string{v1.LabelOSStable: "dummyOS"},
+			podStatus:   v1.PodFailed,
+		},
+		{
+			name:        "correct OS label, correct pod selector, admission denied",
+			nodeLabels:  map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH},
+			podSelector: map[string]string{v1.LabelOSStable: goruntime.GOOS},
+			podStatus:   v1.PodPending,
+		},
+		{
+			// Expect no patching to happen, label B should be preserved and can be used for nodeAffinity.
+			name:        "new node label, correct pod selector, admitted",
+			nodeLabels:  map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH, "key": "B"},
+			podSelector: map[string]string{"key": "B"},
+			podStatus:   v1.PodPending,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+			nodes := []*v1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: testKubeletHostname, Labels: test.nodeLabels},
+					Status: v1.NodeStatus{
+						Allocatable: v1.ResourceList{
+							v1.ResourcePods: *resource.NewQuantity(110, resource.DecimalSI),
+						},
+					},
+				},
+			}
+			kl.nodeLister = testNodeLister{nodes: nodes}
+
+			recorder := record.NewFakeRecorder(20)
+			nodeRef := &v1.ObjectReference{
+				Kind:      "Node",
+				Name:      "testNode",
+				UID:       types.UID("testNode"),
+				Namespace: "",
+			}
+			testClusterDNSDomain := "TEST"
+			kl.dnsConfigurer = dns.NewConfigurer(recorder, nodeRef, nil, nil, testClusterDNSDomain, "")
+
+			pod := podWithUIDNameNsSpec("123456789", "podA", "foo", v1.PodSpec{NodeSelector: test.podSelector})
+
+			kl.HandlePodAdditions([]*v1.Pod{pod})
+
+			// Check pod status stored in the status map.
+			checkPodStatus(t, kl, pod, test.podStatus)
+		})
+	}
+}
+
 // Tests that we handle exceeded resources correctly by setting the failed status in status map.
 func TestHandleMemExceeded(t *testing.T) {
 	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
@@ -603,7 +961,7 @@ func TestHandleMemExceeded(t *testing.T) {
 	recorder := record.NewFakeRecorder(20)
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
-		Name:      string("testNode"),
+		Name:      "testNode",
 		UID:       types.UID("testNode"),
 		Namespace: "",
 	}
@@ -627,6 +985,10 @@ func TestHandleMemExceeded(t *testing.T) {
 	// The newer pod should be rejected.
 	notfittingPod := pods[0]
 	fittingPod := pods[1]
+	kl.podWorkers.(*fakePodWorkers).running = map[types.UID]bool{
+		pods[0].UID: true,
+		pods[1].UID: true,
+	}
 
 	kl.HandlePodAdditions(pods)
 
@@ -697,7 +1059,7 @@ func TestHandlePluginResources(t *testing.T) {
 	recorder := record.NewFakeRecorder(20)
 	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
-		Name:      string("testNode"),
+		Name:      "testNode",
 		UID:       types.UID("testNode"),
 		Namespace: "",
 	}
@@ -943,25 +1305,40 @@ func TestValidateContainerLogStatus(t *testing.T) {
 }
 
 func TestCreateMirrorPod(t *testing.T) {
-	for _, updateType := range []kubetypes.SyncPodType{kubetypes.SyncPodCreate, kubetypes.SyncPodUpdate} {
-		testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
-		defer testKubelet.Cleanup()
+	tests := []struct {
+		name       string
+		updateType kubetypes.SyncPodType
+	}{
+		{
+			name:       "SyncPodCreate",
+			updateType: kubetypes.SyncPodCreate,
+		},
+		{
+			name:       "SyncPodUpdate",
+			updateType: kubetypes.SyncPodUpdate,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
 
-		kl := testKubelet.kubelet
-		manager := testKubelet.fakeMirrorClient
-		pod := podWithUIDNameNs("12345678", "bar", "foo")
-		pod.Annotations[kubetypes.ConfigSourceAnnotationKey] = "file"
-		pods := []*v1.Pod{pod}
-		kl.podManager.SetPods(pods)
-		err := kl.syncPod(syncPodOptions{
-			pod:        pod,
-			podStatus:  &kubecontainer.PodStatus{},
-			updateType: updateType,
+			kl := testKubelet.kubelet
+			manager := testKubelet.fakeMirrorClient
+			pod := podWithUIDNameNs("12345678", "bar", "foo")
+			pod.Annotations[kubetypes.ConfigSourceAnnotationKey] = "file"
+			pods := []*v1.Pod{pod}
+			kl.podManager.SetPods(pods)
+			isTerminal, err := kl.syncPod(context.Background(), tt.updateType, pod, nil, &kubecontainer.PodStatus{})
+			assert.NoError(t, err)
+			if isTerminal {
+				t.Fatalf("pod should not be terminal: %#v", pod)
+			}
+			podFullName := kubecontainer.GetPodFullName(pod)
+			assert.True(t, manager.HasPod(podFullName), "Expected mirror pod %q to be created", podFullName)
+			assert.Equal(t, 1, manager.NumOfPods(), "Expected only 1 mirror pod %q, got %+v", podFullName, manager.GetPods())
 		})
-		assert.NoError(t, err)
-		podFullName := kubecontainer.GetPodFullName(pod)
-		assert.True(t, manager.HasPod(podFullName), "Expected mirror pod %q to be created", podFullName)
-		assert.Equal(t, 1, manager.NumOfPods(), "Expected only 1 mirror pod %q, got %+v", podFullName, manager.GetPods())
 	}
 }
 
@@ -989,13 +1366,11 @@ func TestDeleteOutdatedMirrorPod(t *testing.T) {
 
 	pods := []*v1.Pod{pod, mirrorPod}
 	kl.podManager.SetPods(pods)
-	err := kl.syncPod(syncPodOptions{
-		pod:        pod,
-		mirrorPod:  mirrorPod,
-		podStatus:  &kubecontainer.PodStatus{},
-		updateType: kubetypes.SyncPodUpdate,
-	})
+	isTerminal, err := kl.syncPod(context.Background(), kubetypes.SyncPodUpdate, pod, mirrorPod, &kubecontainer.PodStatus{})
 	assert.NoError(t, err)
+	if isTerminal {
+		t.Fatalf("pod should not be terminal: %#v", pod)
+	}
 	name := kubecontainer.GetPodFullName(pod)
 	creates, deletes := manager.GetCounts(name)
 	if creates != 1 || deletes != 1 {
@@ -1032,17 +1407,41 @@ func TestDeleteOrphanedMirrorPods(t *testing.T) {
 				},
 			},
 		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:       "12345670",
+				Name:      "pod3",
+				Namespace: "ns",
+				Annotations: map[string]string{
+					kubetypes.ConfigSourceAnnotationKey: "api",
+					kubetypes.ConfigMirrorAnnotationKey: "mirror",
+				},
+			},
+		},
 	}
 
 	kl.podManager.SetPods(orphanPods)
+
+	// a static pod that is terminating will not be deleted
+	kl.podWorkers.(*fakePodWorkers).terminatingStaticPods = map[string]bool{
+		kubecontainer.GetPodFullName(orphanPods[2]): true,
+	}
+
 	// Sync with an empty pod list to delete all mirror pods.
 	kl.HandlePodCleanups()
 	assert.Len(t, manager.GetPods(), 0, "Expected 0 mirror pods")
-	for _, pod := range orphanPods {
+	for i, pod := range orphanPods {
 		name := kubecontainer.GetPodFullName(pod)
 		creates, deletes := manager.GetCounts(name)
-		if creates != 0 || deletes != 1 {
-			t.Errorf("expected 0 creation and one deletion of %q, got %d, %d", name, creates, deletes)
+		switch i {
+		case 2:
+			if creates != 0 || deletes != 0 {
+				t.Errorf("expected 0 creation and 0 deletion of %q, got %d, %d", name, creates, deletes)
+			}
+		default:
+			if creates != 0 || deletes != 1 {
+				t.Errorf("expected 0 creation and one deletion of %q, got %d, %d", name, creates, deletes)
+			}
 		}
 	}
 }
@@ -1127,32 +1526,33 @@ func TestNetworkErrorsWithoutHostNetwork(t *testing.T) {
 	})
 
 	kubelet.podManager.SetPods([]*v1.Pod{pod})
-	err := kubelet.syncPod(syncPodOptions{
-		pod:        pod,
-		podStatus:  &kubecontainer.PodStatus{},
-		updateType: kubetypes.SyncPodUpdate,
-	})
+	isTerminal, err := kubelet.syncPod(context.Background(), kubetypes.SyncPodUpdate, pod, nil, &kubecontainer.PodStatus{})
 	assert.Error(t, err, "expected pod with hostNetwork=false to fail when network in error")
+	if isTerminal {
+		t.Fatalf("pod should not be terminal: %#v", pod)
+	}
 
 	pod.Annotations[kubetypes.ConfigSourceAnnotationKey] = kubetypes.FileSource
 	pod.Spec.HostNetwork = true
-	err = kubelet.syncPod(syncPodOptions{
-		pod:        pod,
-		podStatus:  &kubecontainer.PodStatus{},
-		updateType: kubetypes.SyncPodUpdate,
-	})
+	isTerminal, err = kubelet.syncPod(context.Background(), kubetypes.SyncPodUpdate, pod, nil, &kubecontainer.PodStatus{})
 	assert.NoError(t, err, "expected pod with hostNetwork=true to succeed when network in error")
+	if isTerminal {
+		t.Fatalf("pod should not be terminal: %#v", pod)
+	}
 }
 
-func TestFilterOutTerminatedPods(t *testing.T) {
+func TestFilterOutInactivePods(t *testing.T) {
 	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
 	defer testKubelet.Cleanup()
 	kubelet := testKubelet.kubelet
-	pods := newTestPods(5)
+	pods := newTestPods(8)
 	now := metav1.NewTime(time.Now())
+
+	// terminal pods are excluded
 	pods[0].Status.Phase = v1.PodFailed
 	pods[1].Status.Phase = v1.PodSucceeded
-	// The pod is terminating, should not filter out.
+
+	// deleted pod is included unless it's known to be terminated
 	pods[2].Status.Phase = v1.PodRunning
 	pods[2].DeletionTimestamp = &now
 	pods[2].Status.ContainerStatuses = []v1.ContainerStatus{
@@ -1162,13 +1562,145 @@ func TestFilterOutTerminatedPods(t *testing.T) {
 			},
 		}},
 	}
+
+	// pending and running pods are included
 	pods[3].Status.Phase = v1.PodPending
 	pods[4].Status.Phase = v1.PodRunning
 
-	expected := []*v1.Pod{pods[2], pods[3], pods[4]}
+	// pod that is running but has been rejected by admission is excluded
+	pods[5].Status.Phase = v1.PodRunning
+	kubelet.statusManager.SetPodStatus(pods[5], v1.PodStatus{Phase: v1.PodFailed})
+
+	// pod that is running according to the api but is known terminated is excluded
+	pods[6].Status.Phase = v1.PodRunning
+	kubelet.podWorkers.(*fakePodWorkers).terminated = map[types.UID]bool{
+		pods[6].UID: true,
+	}
+
+	// pod that is failed but still terminating is included (it may still be consuming
+	// resources)
+	pods[7].Status.Phase = v1.PodFailed
+	kubelet.podWorkers.(*fakePodWorkers).terminationRequested = map[types.UID]bool{
+		pods[7].UID: true,
+	}
+
+	expected := []*v1.Pod{pods[2], pods[3], pods[4], pods[7]}
 	kubelet.podManager.SetPods(pods)
-	actual := kubelet.filterOutTerminatedPods(pods)
+	actual := kubelet.filterOutInactivePods(pods)
 	assert.Equal(t, expected, actual)
+}
+
+func TestCheckpointContainer(t *testing.T) {
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
+	kubelet := testKubelet.kubelet
+
+	fakeRuntime := testKubelet.fakeRuntime
+	containerID := kubecontainer.ContainerID{
+		Type: "test",
+		ID:   "abc1234",
+	}
+
+	fakePod := &containertest.FakePod{
+		Pod: &kubecontainer.Pod{
+			ID:        "12345678",
+			Name:      "podFoo",
+			Namespace: "nsFoo",
+			Containers: []*kubecontainer.Container{
+				{
+					Name: "containerFoo",
+					ID:   containerID,
+				},
+			},
+		},
+	}
+
+	fakeRuntime.PodList = []*containertest.FakePod{fakePod}
+	wrongContainerName := "wrongContainerName"
+
+	tests := []struct {
+		name               string
+		containerName      string
+		checkpointLocation string
+		expectedStatus     error
+		expectedLocation   string
+	}{
+		{
+			name:               "Checkpoint with wrong container name",
+			containerName:      wrongContainerName,
+			checkpointLocation: "",
+			expectedStatus:     fmt.Errorf("container %s not found", wrongContainerName),
+			expectedLocation:   "",
+		},
+		{
+			name:               "Checkpoint with default checkpoint location",
+			containerName:      fakePod.Pod.Containers[0].Name,
+			checkpointLocation: "",
+			expectedStatus:     nil,
+			expectedLocation: filepath.Join(
+				kubelet.getCheckpointsDir(),
+				fmt.Sprintf(
+					"checkpoint-%s_%s-%s",
+					fakePod.Pod.Name,
+					fakePod.Pod.Namespace,
+					fakePod.Pod.Containers[0].Name,
+				),
+			),
+		},
+		{
+			name:               "Checkpoint with ignored location",
+			containerName:      fakePod.Pod.Containers[0].Name,
+			checkpointLocation: "somethingThatWillBeIgnored",
+			expectedStatus:     nil,
+			expectedLocation: filepath.Join(
+				kubelet.getCheckpointsDir(),
+				fmt.Sprintf(
+					"checkpoint-%s_%s-%s",
+					fakePod.Pod.Name,
+					fakePod.Pod.Namespace,
+					fakePod.Pod.Containers[0].Name,
+				),
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := &runtimeapi.CheckpointContainerRequest{}
+			if test.checkpointLocation != "" {
+				options.Location = test.checkpointLocation
+			}
+			status := kubelet.CheckpointContainer(
+				fakePod.Pod.ID,
+				fmt.Sprintf(
+					"%s_%s",
+					fakePod.Pod.Name,
+					fakePod.Pod.Namespace,
+				),
+				test.containerName,
+				options,
+			)
+			require.Equal(t, status, test.expectedStatus)
+
+			if status != nil {
+				return
+			}
+
+			require.True(
+				t,
+				strings.HasPrefix(
+					options.Location,
+					test.expectedLocation,
+				),
+			)
+			require.Equal(
+				t,
+				options.ContainerId,
+				containerID.ID,
+			)
+
+		})
+	}
 }
 
 func TestSyncPodsSetStatusToFailedForPodsThatRunTooLong(t *testing.T) {
@@ -1309,6 +1841,7 @@ func TestDeletePodDirsForDeletedPods(t *testing.T) {
 }
 
 func syncAndVerifyPodDir(t *testing.T, testKubelet *TestKubelet, pods []*v1.Pod, podsToCheck []*v1.Pod, shouldExist bool) {
+	t.Helper()
 	kl := testKubelet.kubelet
 
 	kl.podManager.SetPods(pods)
@@ -1329,7 +1862,6 @@ func TestDoesNotDeletePodDirsForTerminatedPods(t *testing.T) {
 		podWithUIDNameNs("12345679", "pod2", "ns"),
 		podWithUIDNameNs("12345680", "pod3", "ns"),
 	}
-
 	syncAndVerifyPodDir(t, testKubelet, pods, pods, true)
 	// Pod 1 failed, and pod 2 succeeded. None of the pod directories should be
 	// deleted.
@@ -1351,6 +1883,7 @@ func TestDoesNotDeletePodDirsIfContainerIsRunning(t *testing.T) {
 	// Sync once to create pod directory; confirm that the pod directory has
 	// already been created.
 	pods := []*v1.Pod{apiPod}
+	testKubelet.kubelet.podWorkers.(*fakePodWorkers).running = map[types.UID]bool{apiPod.UID: true}
 	syncAndVerifyPodDir(t, testKubelet, pods, []*v1.Pod{apiPod}, true)
 
 	// Pretend the pod is deleted from apiserver, but is still active on the node.
@@ -1363,6 +1896,7 @@ func TestDoesNotDeletePodDirsIfContainerIsRunning(t *testing.T) {
 	// should be removed.
 	pods = []*v1.Pod{}
 	testKubelet.fakeRuntime.PodList = []*containertest.FakePod{}
+	testKubelet.kubelet.podWorkers.(*fakePodWorkers).running = nil
 	syncAndVerifyPodDir(t, testKubelet, pods, []*v1.Pod{apiPod}, false)
 }
 
@@ -1442,18 +1976,16 @@ func TestGenerateAPIPodStatusWithSortedContainers(t *testing.T) {
 	}
 }
 
-func verifyContainerStatuses(t *testing.T, statuses []v1.ContainerStatus, state, lastTerminationState map[string]v1.ContainerState, message string) {
+func verifyContainerStatuses(t *testing.T, statuses []v1.ContainerStatus, expectedState, expectedLastTerminationState map[string]v1.ContainerState, message string) {
 	for _, s := range statuses {
-		assert.Equal(t, s.State, state[s.Name], "%s: state", message)
-		assert.Equal(t, s.LastTerminationState, lastTerminationState[s.Name], "%s: last terminated state", message)
+		assert.Equal(t, expectedState[s.Name], s.State, "%s: state", message)
+		assert.Equal(t, expectedLastTerminationState[s.Name], s.LastTerminationState, "%s: last terminated state", message)
 	}
 }
 
 // Test generateAPIPodStatus with different reason cache and old api pod status.
 func TestGenerateAPIPodStatusWithReasonCache(t *testing.T) {
 	// The following waiting reason and message  are generated in convertStatusToAPIStatus()
-	startWaitingReason := "ContainerCreating"
-	initWaitingReason := "PodInitializing"
 	testTimestamp := time.Unix(123456789, 987654321)
 	testErrorReason := fmt.Errorf("test-error")
 	emptyContainerID := (&kubecontainer.ContainerID{}).String()
@@ -1490,18 +2022,18 @@ func TestGenerateAPIPodStatusWithReasonCache(t *testing.T) {
 			}},
 			expectedState: map[string]v1.ContainerState{
 				"without-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: startWaitingReason,
+					Reason: ContainerCreating,
 				}},
 				"with-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: startWaitingReason,
+					Reason: ContainerCreating,
 				}},
 			},
 			expectedInitState: map[string]v1.ContainerState{
 				"without-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: initWaitingReason,
+					Reason: PodInitializing,
 				}},
 				"with-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: initWaitingReason,
+					Reason: PodInitializing,
 				}},
 			},
 			expectedLastTerminationState: map[string]v1.ContainerState{
@@ -1952,7 +2484,7 @@ func TestGenerateAPIPodStatusInvokesPodSyncHandlers(t *testing.T) {
 	require.Equal(t, "because", apiStatus.Message)
 }
 
-func TestSyncPodKillPod(t *testing.T) {
+func TestSyncTerminatingPodKillPod(t *testing.T) {
 	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
 	defer testKubelet.Cleanup()
 	kl := testKubelet.kubelet
@@ -1965,21 +2497,12 @@ func TestSyncPodKillPod(t *testing.T) {
 	}
 	pods := []*v1.Pod{pod}
 	kl.podManager.SetPods(pods)
+	podStatus := &kubecontainer.PodStatus{ID: pod.UID}
 	gracePeriodOverride := int64(0)
-	err := kl.syncPod(syncPodOptions{
-		pod:        pod,
-		podStatus:  &kubecontainer.PodStatus{},
-		updateType: kubetypes.SyncPodKill,
-		killPodOptions: &KillPodOptions{
-			PodStatusFunc: func(p *v1.Pod, podStatus *kubecontainer.PodStatus) v1.PodStatus {
-				return v1.PodStatus{
-					Phase:   v1.PodFailed,
-					Reason:  "reason",
-					Message: "message",
-				}
-			},
-			PodTerminationGracePeriodSecondsOverride: &gracePeriodOverride,
-		},
+	err := kl.syncTerminatingPod(context.Background(), pod, podStatus, nil, &gracePeriodOverride, func(podStatus *v1.PodStatus) {
+		podStatus.Phase = v1.PodFailed
+		podStatus.Reason = "reason"
+		podStatus.Message = "message"
 	})
 	require.NoError(t, err)
 
@@ -1987,10 +2510,102 @@ func TestSyncPodKillPod(t *testing.T) {
 	checkPodStatus(t, kl, pod, v1.PodFailed)
 }
 
-func TestPreInitRuntimeService(t *testing.T) {
-	err := PreInitRuntimeService(nil, nil, nil, "", "", "", "", "")
-	if err == nil {
-		t.Fatal("PreInitRuntimeService should fail when not configured with a container runtime")
+func TestSyncLabels(t *testing.T) {
+	tests := []struct {
+		name             string
+		existingNode     *v1.Node
+		isPatchingNeeded bool
+	}{
+		{
+			name:             "no labels",
+			existingNode:     &v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}},
+			isPatchingNeeded: true,
+		},
+		{
+			name:             "wrong labels",
+			existingNode:     &v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.LabelOSStable: "dummyOS", v1.LabelArchStable: "dummyArch"}}},
+			isPatchingNeeded: true,
+		},
+		{
+			name:             "correct labels",
+			existingNode:     &v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH}}},
+			isPatchingNeeded: false,
+		},
+		{
+			name:             "partially correct labels",
+			existingNode:     &v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: "dummyArch"}}},
+			isPatchingNeeded: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testKubelet := newTestKubelet(t, false)
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+			kubeClient := testKubelet.fakeKubeClient
+
+			test.existingNode.Name = string(kl.nodeName)
+
+			kl.nodeLister = testNodeLister{nodes: []*v1.Node{test.existingNode}}
+			go func() { kl.syncNodeStatus() }()
+
+			err := retryWithExponentialBackOff(
+				100*time.Millisecond,
+				func() (bool, error) {
+					var savedNode *v1.Node
+					if test.isPatchingNeeded {
+						actions := kubeClient.Actions()
+						if len(actions) == 0 {
+							t.Logf("No action yet")
+							return false, nil
+						}
+						for _, action := range actions {
+							if action.GetVerb() == "patch" {
+								var (
+									err          error
+									patchAction  = action.(core.PatchActionImpl)
+									patchContent = patchAction.GetPatch()
+								)
+								savedNode, err = applyNodeStatusPatch(test.existingNode, patchContent)
+								if err != nil {
+									t.Logf("node patching failed, %v", err)
+									return false, nil
+								}
+							}
+						}
+					} else {
+						savedNode = test.existingNode
+					}
+					if savedNode == nil || savedNode.Labels == nil {
+						t.Logf("savedNode.Labels should not be nil")
+						return false, nil
+					}
+					val, ok := savedNode.Labels[v1.LabelOSStable]
+					if !ok {
+						t.Logf("expected kubernetes.io/os label to be present")
+						return false, nil
+					}
+					if val != goruntime.GOOS {
+						t.Logf("expected kubernetes.io/os to match runtime.GOOS but got %v", val)
+						return false, nil
+					}
+					val, ok = savedNode.Labels[v1.LabelArchStable]
+					if !ok {
+						t.Logf("expected kubernetes.io/arch label to be present")
+						return false, nil
+					}
+					if val != goruntime.GOARCH {
+						t.Logf("expected kubernetes.io/arch to match runtime.GOARCH but got %v", val)
+						return false, nil
+					}
+					return true, nil
+				},
+			)
+			if err != nil {
+				t.Fatalf("expected labels to be reconciled but it failed with %v", err)
+			}
+		})
 	}
 }
 

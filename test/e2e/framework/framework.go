@@ -24,8 +24,8 @@ package framework
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -47,8 +47,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	scaleclient "k8s.io/client-go/scale"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
 	// TODO: Remove the following imports (ref: https://github.com/kubernetes/kubernetes/issues/81245)
@@ -78,11 +79,11 @@ type Framework struct {
 
 	ScalesGetter scaleclient.ScalesGetter
 
-	SkipNamespaceCreation    bool            // Whether to skip creating a namespace
-	Namespace                *v1.Namespace   // Every test has at least one namespace unless creation is skipped
-	namespacesToDelete       []*v1.Namespace // Some tests have more than one.
-	NamespaceDeletionTimeout time.Duration
-	SkipPrivilegedPSPBinding bool // Whether to skip creating a binding to the privileged PSP in the test namespace
+	SkipNamespaceCreation            bool            // Whether to skip creating a namespace
+	Namespace                        *v1.Namespace   // Every test has at least one namespace unless creation is skipped
+	namespacesToDelete               []*v1.Namespace // Some tests have more than one.
+	NamespaceDeletionTimeout         time.Duration
+	NamespacePodSecurityEnforceLevel admissionapi.Level // The pod security enforcement level for namespaces to be applied.
 
 	gatherer *ContainerResourceGatherer
 	// Constraints that passed to a check which is executed after data is gathered to
@@ -119,6 +120,9 @@ type Framework struct {
 
 	// Place to keep ClusterAutoscaler metrics from before test in order to compute delta.
 	clusterAutoscalerMetricsBeforeTest e2emetrics.Collection
+
+	// Timeouts contains the custom timeouts used during the test execution.
+	Timeouts *TimeoutContext
 }
 
 // AfterEachActionFunc is a function that can be called after each test
@@ -138,6 +142,13 @@ type Options struct {
 	GroupVersion *schema.GroupVersion
 }
 
+// NewFrameworkWithCustomTimeouts makes a framework with with custom timeouts.
+func NewFrameworkWithCustomTimeouts(baseName string, timeouts *TimeoutContext) *Framework {
+	f := NewDefaultFramework(baseName)
+	f.Timeouts = timeouts
+	return f
+}
+
 // NewDefaultFramework makes a new framework and sets up a BeforeEach/AfterEach for
 // you (you can write additional before/after each functions).
 func NewDefaultFramework(baseName string) *Framework {
@@ -155,6 +166,7 @@ func NewFramework(baseName string, options Options, client clientset.Interface) 
 		AddonResourceConstraints: make(map[string]ResourceConstraint),
 		Options:                  options,
 		ClientSet:                client,
+		Timeouts:                 NewTimeoutContextWithDefaults(),
 	}
 
 	f.AddAfterEach("dumpNamespaceInfo", func(f *Framework, failed bool) {
@@ -182,7 +194,7 @@ func (f *Framework) BeforeEach() {
 	f.beforeEachStarted = true
 
 	// The fact that we need this feels like a bug in ginkgo.
-	// https://github.com/onsi/ginkgo/issues/222
+	// https://github.com/onsi/ginkgo/v2/issues/222
 	f.cleanupHandle = AddCleanupAction(f.AfterEach)
 	if f.ClientSet == nil {
 		ginkgo.By("Creating a kubernetes client")
@@ -201,10 +213,6 @@ func (f *Framework) BeforeEach() {
 		f.ClientSet, err = clientset.NewForConfig(config)
 		ExpectNoError(err)
 		f.DynamicClient, err = dynamic.NewForConfig(config)
-		ExpectNoError(err)
-		// node.k8s.io is based on CRD, which is served only as JSON
-		jsonConfig := config
-		jsonConfig.ContentType = "application/json"
 		ExpectNoError(err)
 
 		// create scales getter, set GroupVersion and NegotiatedSerializer to default values
@@ -240,6 +248,9 @@ func (f *Framework) BeforeEach() {
 		if TestContext.VerifyServiceAccount {
 			ginkgo.By("Waiting for a default service account to be provisioned in namespace")
 			err = WaitForDefaultServiceAccountInNamespace(f.ClientSet, namespace.Name)
+			ExpectNoError(err)
+			ginkgo.By("Waiting for kube-root-ca.crt to be provisioned in namespace")
+			err = WaitForKubeRootCAInNamespace(f.ClientSet, namespace.Name)
 			ExpectNoError(err)
 		} else {
 			Logf("Skipping waiting for service account")
@@ -289,7 +300,7 @@ func (f *Framework) BeforeEach() {
 
 	gatherMetricsAfterTest := TestContext.GatherMetricsAfterTest == "true" || TestContext.GatherMetricsAfterTest == "master"
 	if gatherMetricsAfterTest && TestContext.IncludeClusterAutoscalerMetrics {
-		grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, !ProviderIs("kubemark"), false, false, false, TestContext.IncludeClusterAutoscalerMetrics)
+		grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, f.ClientConfig(), !ProviderIs("kubemark"), false, false, false, TestContext.IncludeClusterAutoscalerMetrics, false)
 		if err != nil {
 			Logf("Failed to create MetricsGrabber (skipping ClusterAutoscaler metrics gathering before test): %v", err)
 		} else {
@@ -318,7 +329,7 @@ func printSummaries(summaries []TestDataSummary, testBaseName string) {
 			} else {
 				// TODO: learn to extract test name and append it to the kind instead of timestamp.
 				filePath := path.Join(TestContext.ReportDir, summaries[i].SummaryKind()+"_"+testBaseName+"_"+now.Format(time.RFC3339)+".txt")
-				if err := ioutil.WriteFile(filePath, []byte(summaries[i].PrintHumanReadable()), 0644); err != nil {
+				if err := os.WriteFile(filePath, []byte(summaries[i].PrintHumanReadable()), 0644); err != nil {
 					Logf("Failed to write file %v with test performance data: %v", filePath, err)
 				}
 			}
@@ -335,7 +346,7 @@ func printSummaries(summaries []TestDataSummary, testBaseName string) {
 				// TODO: learn to extract test name and append it to the kind instead of timestamp.
 				filePath := path.Join(TestContext.ReportDir, summaries[i].SummaryKind()+"_"+testBaseName+"_"+now.Format(time.RFC3339)+".json")
 				Logf("Writing to %s", filePath)
-				if err := ioutil.WriteFile(filePath, []byte(summaries[i].PrintJSON()), 0644); err != nil {
+				if err := os.WriteFile(filePath, []byte(summaries[i].PrintJSON()), 0644); err != nil {
 					Logf("Failed to write file %v with test performance data: %v", filePath, err)
 				}
 			}
@@ -379,7 +390,7 @@ func (f *Framework) AfterEach() {
 		// Whether to delete namespace is determined by 3 factors: delete-namespace flag, delete-namespace-on-failure flag and the test result
 		// if delete-namespace set to false, namespace will always be preserved.
 		// if delete-namespace is true and delete-namespace-on-failure is false, namespace will be preserved if test failed.
-		if TestContext.DeleteNamespace && (TestContext.DeleteNamespaceOnFailure || !ginkgo.CurrentGinkgoTestDescription().Failed) {
+		if TestContext.DeleteNamespace && (TestContext.DeleteNamespaceOnFailure || !ginkgo.CurrentSpecReport().Failed()) {
 			for _, ns := range f.namespacesToDelete {
 				ginkgo.By(fmt.Sprintf("Destroying namespace %q for this suite.", ns.Name))
 				if err := f.ClientSet.CoreV1().Namespaces().Delete(context.TODO(), ns.Name, metav1.DeleteOptions{}); err != nil {
@@ -387,7 +398,7 @@ func (f *Framework) AfterEach() {
 						nsDeletionErrors[ns.Name] = err
 
 						// Dump namespace if we are unable to delete the namespace and the dump was not already performed.
-						if !ginkgo.CurrentGinkgoTestDescription().Failed && TestContext.DumpLogsOnFailure {
+						if !ginkgo.CurrentSpecReport().Failed() && TestContext.DumpLogsOnFailure {
 							DumpAllNamespaceInfo(f.ClientSet, ns.Name)
 						}
 					} else {
@@ -421,7 +432,7 @@ func (f *Framework) AfterEach() {
 
 	// run all aftereach functions in random order to ensure no dependencies grow
 	for _, afterEachFn := range f.afterEaches {
-		afterEachFn(f, ginkgo.CurrentGinkgoTestDescription().Failed)
+		afterEachFn(f, ginkgo.CurrentSpecReport().Failed())
 	}
 
 	if TestContext.GatherKubeSystemResourceUsageData != "false" && TestContext.GatherKubeSystemResourceUsageData != "none" && f.gatherer != nil {
@@ -442,7 +453,7 @@ func (f *Framework) AfterEach() {
 		ginkgo.By("Gathering metrics")
 		// Grab apiserver, scheduler, controller-manager metrics and (optionally) nodes' kubelet metrics.
 		grabMetricsFromKubelets := TestContext.GatherMetricsAfterTest != "master" && !ProviderIs("kubemark")
-		grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, grabMetricsFromKubelets, true, true, true, TestContext.IncludeClusterAutoscalerMetrics)
+		grabber, err := e2emetrics.NewMetricsGrabber(f.ClientSet, f.KubemarkExternalClusterClientSet, f.ClientConfig(), grabMetricsFromKubelets, true, true, true, TestContext.IncludeClusterAutoscalerMetrics, false)
 		if err != nil {
 			Logf("Failed to create MetricsGrabber (skipping metrics gathering): %v", err)
 		} else {
@@ -499,7 +510,7 @@ func (f *Framework) DeleteNamespace(name string) {
 		}
 	}()
 	// if current test failed then we should dump namespace information
-	if !f.SkipNamespaceCreation && ginkgo.CurrentGinkgoTestDescription().Failed && TestContext.DumpLogsOnFailure {
+	if !f.SkipNamespaceCreation && ginkgo.CurrentSpecReport().Failed() && TestContext.DumpLogsOnFailure {
 		DumpAllNamespaceInfo(f.ClientSet, name)
 	}
 
@@ -511,14 +522,27 @@ func (f *Framework) CreateNamespace(baseName string, labels map[string]string) (
 	if createTestingNS == nil {
 		createTestingNS = CreateTestingNS
 	}
+
+	if labels == nil {
+		labels = make(map[string]string)
+	} else {
+		labelsCopy := make(map[string]string)
+		for k, v := range labels {
+			labelsCopy[k] = v
+		}
+		labels = labelsCopy
+	}
+
+	enforceLevel := admissionapi.LevelRestricted
+	if f.NamespacePodSecurityEnforceLevel != "" {
+		enforceLevel = f.NamespacePodSecurityEnforceLevel
+	}
+	labels[admissionapi.EnforceLevelLabel] = string(enforceLevel)
+
 	ns, err := createTestingNS(baseName, f.ClientSet, labels)
 	// check ns instead of err to see if it's nil as we may
 	// fail to create serviceAccount in it.
 	f.AddNamespacesToDelete(ns)
-
-	if err == nil && !f.SkipPrivilegedPSPBinding {
-		CreatePrivilegedPSPBinding(f.ClientSet, ns.Name)
-	}
 
 	return ns, err
 }
@@ -526,7 +550,7 @@ func (f *Framework) CreateNamespace(baseName string, labels map[string]string) (
 // RecordFlakeIfError records flakeness info if error happens.
 // NOTE: This function is not used at any places yet, but we are in progress for https://github.com/kubernetes/kubernetes/issues/66239 which requires this. Please don't remove this.
 func (f *Framework) RecordFlakeIfError(err error, optionalDescription ...interface{}) {
-	f.flakeReport.RecordFlakeIfError(err, optionalDescription)
+	f.flakeReport.RecordFlakeIfError(err, optionalDescription...)
 }
 
 // AddNamespacesToDelete adds one or more namespaces to be deleted when the test
@@ -618,15 +642,9 @@ func (kc *KubeConfig) FindCluster(name string) *KubeCluster {
 	return nil
 }
 
-// KubeDescribe is wrapper function for ginkgo describe.  Adds namespacing.
-// TODO: Support type safe tagging as well https://github.com/kubernetes/kubernetes/pull/22401.
-func KubeDescribe(text string, body func()) bool {
-	return ginkgo.Describe("[k8s.io] "+text, body)
-}
-
 // ConformanceIt is wrapper function for ginkgo It.  Adds "[Conformance]" tag and makes static analysis easier.
-func ConformanceIt(text string, body interface{}, timeout ...float64) bool {
-	return ginkgo.It(text+" [Conformance]", body, timeout...)
+func ConformanceIt(text string, body interface{}) bool {
+	return ginkgo.It(text+" [Conformance]", ginkgo.Offset(1), body)
 }
 
 // PodStateVerification represents a verification of pod state.

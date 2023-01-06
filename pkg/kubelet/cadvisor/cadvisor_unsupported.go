@@ -1,3 +1,4 @@
+//go:build !linux && !windows
 // +build !linux,!windows
 
 /*
@@ -32,7 +33,7 @@ type cadvisorUnsupported struct {
 var _ Interface = new(cadvisorUnsupported)
 
 // New creates a new cAdvisor Interface for unsupported systems.
-func New(imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupsRoots []string, usingLegacyStats bool) (Interface, error) {
+func New(imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupsRoots []string, usingLegacyStats, localStorageCapacityIsolation bool) (Interface, error) {
 	return &cadvisorUnsupported{}, nil
 }
 

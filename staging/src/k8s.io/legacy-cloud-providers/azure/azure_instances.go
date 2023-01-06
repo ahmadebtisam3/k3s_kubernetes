@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -20,6 +21,7 @@ package azure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -29,6 +31,8 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
 	azcache "k8s.io/legacy-cloud-providers/azure/cache"
+
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
 )
 
 const (
@@ -233,10 +237,22 @@ func (az *Cloud) InstanceShutdownByProviderID(ctx context.Context, providerID st
 
 		return false, err
 	}
-	klog.V(5).Infof("InstanceShutdownByProviderID gets power status %q for node %q", powerStatus, nodeName)
+	klog.V(3).Infof("InstanceShutdownByProviderID gets power status %q for node %q", powerStatus, nodeName)
+
+	provisioningState, err := az.VMSet.GetProvisioningStateByNodeName(string(nodeName))
+	if err != nil {
+		// Returns false, so the controller manager will continue to check InstanceExistsByProviderID().
+		if errors.Is(err, cloudprovider.InstanceNotFound) {
+			return false, nil
+		}
+
+		return false, err
+	}
+	klog.V(3).Infof("InstanceShutdownByProviderID gets provisioning state %q for node %q", provisioningState, nodeName)
 
 	status := strings.ToLower(powerStatus)
-	return status == vmPowerStateStopped || status == vmPowerStateDeallocated || status == vmPowerStateDeallocating, nil
+	provisioningSucceeded := strings.EqualFold(strings.ToLower(provisioningState), strings.ToLower(string(compute.ProvisioningStateSucceeded)))
+	return provisioningSucceeded && (status == vmPowerStateStopped || status == vmPowerStateDeallocated || status == vmPowerStateDeallocating), nil
 }
 
 func (az *Cloud) isCurrentInstance(name types.NodeName, metadataVMName string) (bool, error) {
@@ -353,7 +369,8 @@ func (az *Cloud) InstanceTypeByProviderID(ctx context.Context, providerID string
 // InstanceType returns the type of the specified instance.
 // Note that if the instance does not exist or is no longer running, we must return ("", cloudprovider.InstanceNotFound)
 // (Implementer Note): This is used by kubelet. Kubelet will label the node. Real log from kubelet:
-//       Adding node label from cloud provider: beta.kubernetes.io/instance-type=[value]
+//
+//	Adding node label from cloud provider: beta.kubernetes.io/instance-type=[value]
 func (az *Cloud) InstanceType(ctx context.Context, name types.NodeName) (string, error) {
 	// Returns "" for unmanaged nodes because azure cloud provider couldn't fetch information for them.
 	unmanaged, err := az.IsNodeUnmanaged(string(name))

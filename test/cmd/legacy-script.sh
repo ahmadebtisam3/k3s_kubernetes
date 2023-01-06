@@ -33,6 +33,7 @@ source "${KUBE_ROOT}/test/cmd/authentication.sh"
 source "${KUBE_ROOT}/test/cmd/authorization.sh"
 source "${KUBE_ROOT}/test/cmd/batch.sh"
 source "${KUBE_ROOT}/test/cmd/certificate.sh"
+source "${KUBE_ROOT}/test/cmd/convert.sh"
 source "${KUBE_ROOT}/test/cmd/core.sh"
 source "${KUBE_ROOT}/test/cmd/crd.sh"
 source "${KUBE_ROOT}/test/cmd/create.sh"
@@ -40,6 +41,7 @@ source "${KUBE_ROOT}/test/cmd/debug.sh"
 source "${KUBE_ROOT}/test/cmd/delete.sh"
 source "${KUBE_ROOT}/test/cmd/diff.sh"
 source "${KUBE_ROOT}/test/cmd/discovery.sh"
+source "${KUBE_ROOT}/test/cmd/events.sh"
 source "${KUBE_ROOT}/test/cmd/exec.sh"
 source "${KUBE_ROOT}/test/cmd/generic-resources.sh"
 source "${KUBE_ROOT}/test/cmd/get.sh"
@@ -49,6 +51,7 @@ source "${KUBE_ROOT}/test/cmd/plugins.sh"
 source "${KUBE_ROOT}/test/cmd/proxy.sh"
 source "${KUBE_ROOT}/test/cmd/rbac.sh"
 source "${KUBE_ROOT}/test/cmd/request-timeout.sh"
+source "${KUBE_ROOT}/test/cmd/results.sh"
 source "${KUBE_ROOT}/test/cmd/run.sh"
 source "${KUBE_ROOT}/test/cmd/save-config.sh"
 source "${KUBE_ROOT}/test/cmd/storage.sh"
@@ -65,15 +68,15 @@ KUBELET_HEALTHZ_PORT=${KUBELET_HEALTHZ_PORT:-10248}
 SECURE_CTLRMGR_PORT=${SECURE_CTLRMGR_PORT:-10257}
 PROXY_HOST=127.0.0.1 # kubectl only serves on localhost.
 
-IMAGE_NGINX="k8s.gcr.io/nginx:1.7.9"
-export IMAGE_DEPLOYMENT_R1="k8s.gcr.io/nginx:test-cmd"  # deployment-revision1.yaml
+IMAGE_NGINX="registry.k8s.io/nginx:1.7.9"
+export IMAGE_DEPLOYMENT_R1="registry.k8s.io/nginx:test-cmd"  # deployment-revision1.yaml
 export IMAGE_DEPLOYMENT_R2="$IMAGE_NGINX"  # deployment-revision2.yaml
-export IMAGE_PERL="k8s.gcr.io/perl"
-export IMAGE_PAUSE_V2="k8s.gcr.io/pause:2.0"
-export IMAGE_DAEMONSET_R2="k8s.gcr.io/pause:latest"
-export IMAGE_DAEMONSET_R2_2="k8s.gcr.io/nginx:test-cmd"  # rollingupdate-daemonset-rv2.yaml
-export IMAGE_STATEFULSET_R1="k8s.gcr.io/nginx-slim:0.7"
-export IMAGE_STATEFULSET_R2="k8s.gcr.io/nginx-slim:0.8"
+export IMAGE_PERL="registry.k8s.io/perl"
+export IMAGE_PAUSE_V2="registry.k8s.io/pause:2.0"
+export IMAGE_DAEMONSET_R2="registry.k8s.io/pause:latest"
+export IMAGE_DAEMONSET_R2_2="registry.k8s.io/nginx:test-cmd"  # rollingupdate-daemonset-rv2.yaml
+export IMAGE_STATEFULSET_R1="registry.k8s.io/nginx-slim:0.7"
+export IMAGE_STATEFULSET_R2="registry.k8s.io/nginx-slim:0.8"
 
 # Expose kubectl directly for readability
 PATH="${KUBE_OUTPUT_HOSTBIN}":$PATH
@@ -82,6 +85,7 @@ PATH="${KUBE_OUTPUT_HOSTBIN}":$PATH
 clusterroles="clusterroles"
 configmaps="configmaps"
 csr="csr"
+cronjob="cronjobs"
 deployments="deployments"
 namespaces="namespaces"
 nodes="nodes"
@@ -103,6 +107,11 @@ daemonsets="daemonsets"
 controllerrevisions="controllerrevisions"
 job="jobs"
 
+# A junit-style XML test report will be generated in the directory specified by KUBE_JUNIT_REPORT_DIR, if set.
+# If KUBE_JUNIT_REPORT_DIR is unset, and ARTIFACTS is set, then use what is set in ARTIFACTS.
+if [[ -z "${KUBE_JUNIT_REPORT_DIR:-}" && -n "${ARTIFACTS:-}" ]]; then
+  export KUBE_JUNIT_REPORT_DIR="${ARTIFACTS}"
+fi
 
 # include shell2junit library
 sh2ju="${KUBE_ROOT}/third_party/forked/shell2junit/sh2ju.sh"
@@ -166,7 +175,7 @@ fi
 function stop-proxy()
 {
   [[ -n "${PROXY_PORT-}" ]] && kube::log::status "Stopping proxy on port ${PROXY_PORT}"
-  [[ -n "${PROXY_PID-}" ]] && kill "${PROXY_PID}" 1>&2 2>/dev/null
+  [[ -n "${PROXY_PID-}" ]] && kill -9 "${PROXY_PID}" 1>&2 2>/dev/null
   [[ -n "${PROXY_PORT_FILE-}" ]] && rm -f "${PROXY_PORT_FILE}"
   PROXY_PID=
   PROXY_PORT=
@@ -215,10 +224,10 @@ function start-proxy()
 
 function cleanup()
 {
-  [[ -n "${APISERVER_PID-}" ]] && kill "${APISERVER_PID}" 1>&2 2>/dev/null
-  [[ -n "${CTLRMGR_PID-}" ]] && kill "${CTLRMGR_PID}" 1>&2 2>/dev/null
-  [[ -n "${KUBELET_PID-}" ]] && kill "${KUBELET_PID}" 1>&2 2>/dev/null
   stop-proxy
+  [[ -n "${CTLRMGR_PID-}" ]] && kill -9 "${CTLRMGR_PID}" 1>&2 2>/dev/null
+  [[ -n "${KUBELET_PID-}" ]] && kill -9 "${KUBELET_PID}" 1>&2 2>/dev/null
+  [[ -n "${APISERVER_PID-}" ]] && kill -9 "${APISERVER_PID}" 1>&2 2>/dev/null
 
   kube::etcd::cleanup
   rm -rf "${KUBE_TEMP}"
@@ -298,7 +307,7 @@ setup() {
   kube::util::ensure-gnu-sed
 
   kube::log::status "Building kubectl"
-  make -C "${KUBE_ROOT}" WHAT="cmd/kubectl"
+  make -C "${KUBE_ROOT}" WHAT="cmd/kubectl cmd/kubectl-convert"
 
   # Check kubectl
   kube::log::status "Running kubectl with no options"
@@ -375,7 +384,7 @@ runTests() {
   export container_name_field="(index .spec.template.spec.containers 0).name"
   export hpa_min_field=".spec.minReplicas"
   export hpa_max_field=".spec.maxReplicas"
-  export hpa_cpu_field=".spec.targetCPUUtilizationPercentage"
+  export hpa_cpu_field="(index .spec.metrics 0).resource.target.averageUtilization"
   export template_labels=".spec.template.metadata.labels.name"
   export statefulset_replicas_field=".spec.replicas"
   export statefulset_observed_generation=".status.observedGeneration"
@@ -433,6 +442,12 @@ runTests() {
   #########################
 
   record_command run_kubectl_version_tests
+
+  ############################
+  # Kubectl result reporting #
+  ############################
+
+  record_command run_kubectl_results_tests
 
   #######################
   # kubectl config set #
@@ -540,6 +555,14 @@ runTests() {
     record_command run_kubectl_get_tests
   fi
 
+  ##################
+  # Kubectl events #
+  ##################
+
+  if kube::test::if_supports_resource "${cronjob}" ; then
+    record_command run_kubectl_events_tests
+  fi
+
   ################
   # Kubectl exec #
   ################
@@ -559,6 +582,14 @@ runTests() {
   fi
   if kube::test::if_supports_resource "${deployments}"; then
     record_command run_kubectl_create_kustomization_directory_tests
+    record_command run_kubectl_create_validate_tests
+  fi
+
+  ######################
+  # Convert            #
+  ######################
+  if kube::test::if_supports_resource "${deployments}"; then
+    record_command run_convert_tests
   fi
 
   ######################
@@ -590,7 +621,7 @@ runTests() {
   #####################################
 
   if kube::test::if_supports_resource "${pods}" ; then
-    run_recursive_resources_tests
+    record_command run_recursive_resources_tests
   fi
 
 
@@ -766,6 +797,7 @@ runTests() {
   ########################
 
   record_command run_exec_credentials_tests
+  record_command run_exec_credentials_interactive_tests
 
   ########################
   # authorization.k8s.io #
@@ -875,6 +907,13 @@ runTests() {
     record_command run_kubectl_explain_tests
   fi
 
+  ##############################
+  # CRD Deletion / Re-creation #
+  ##############################
+
+  if kube::test::if_supports_resource "${namespaces}" ; then
+      record_command run_crd_deletion_recreation_tests
+  fi
 
   ###########
   # Swagger #
@@ -899,6 +938,15 @@ runTests() {
       record_command run_kubectl_all_namespace_tests
     fi
   fi
+
+  ############################
+  # Kubectl deprecated APIs  #
+  ############################
+
+  if kube::test::if_supports_resource "${customresourcedefinitions}" ; then
+    record_command run_deprecated_api_tests
+  fi
+
 
   ######################
   # kubectl --template #

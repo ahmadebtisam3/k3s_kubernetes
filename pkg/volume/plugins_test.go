@@ -87,6 +87,10 @@ func (plugin *testPlugins) SupportsBulkVolumeVerification() bool {
 	return false
 }
 
+func (plugin *testPlugins) SupportsSELinuxContextMount(spec *Spec) (bool, error) {
+	return false, nil
+}
+
 func (plugin *testPlugins) NewMounter(spec *Spec, podRef *v1.Pod, opts VolumeOptions) (Mounter, error) {
 	return nil, nil
 }
@@ -110,7 +114,7 @@ func TestVolumePluginMgrFunc(t *testing.T) {
 
 	plug, err := vpm.FindPluginByName(testPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plug.GetPluginName() != testPluginName {
 		t.Errorf("Wrong name: %s", plug.GetPluginName())

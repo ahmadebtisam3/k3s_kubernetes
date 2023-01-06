@@ -25,8 +25,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
+	"k8s.io/kubernetes/test/e2e/network/common"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 )
 
 var (
@@ -297,7 +298,7 @@ func (t *dnsExternalNameTest) run(isIPv6 bool) {
 		t.checkDNSRecordFrom(
 			fmt.Sprintf("%s.%s.svc.%s", serviceNameLocal, f.Namespace.Name, framework.TestContext.ClusterDNSDomain),
 			func(actual []string) bool {
-				return len(actual) >= 1 && actual[0] == fooHostname+"." && actual[1] == "2001:db8::29"
+				return len(actual) >= 2 && actual[0] == fooHostname+"." && actual[1] == "2001:db8::29"
 			},
 			"cluster-dns-ipv6",
 			moreForeverTestTimeout)
@@ -314,7 +315,7 @@ func (t *dnsExternalNameTest) run(isIPv6 bool) {
 	t.restoreDNSConfigMap(originalConfigMapData)
 }
 
-var _ = SIGDescribe("DNS configMap nameserver", func() {
+var _ = common.SIGDescribe("DNS configMap nameserver", func() {
 
 	ginkgo.Context("Change stubDomain", func() {
 		nsTest := &dnsNameserverTest{dnsTestCommon: newDNSTestCommon()}

@@ -17,72 +17,79 @@ limitations under the License.
 package testsuites
 
 import (
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 
 	v1 "k8s.io/api/core/v1"
-	errors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/errors"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
-	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
-	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
-	"k8s.io/kubernetes/test/e2e/storage/utils"
+	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
+	storageutils "k8s.io/kubernetes/test/e2e/storage/utils"
+	admissionapi "k8s.io/pod-security-admission/api"
 )
 
 type disruptiveTestSuite struct {
-	tsInfo TestSuiteInfo
+	tsInfo storageframework.TestSuiteInfo
 }
 
-var _ TestSuite = &disruptiveTestSuite{}
-
-// InitDisruptiveTestSuite returns subPathTestSuite that implements TestSuite interface
-func InitDisruptiveTestSuite() TestSuite {
+// InitCustomDisruptiveTestSuite returns subPathTestSuite that implements TestSuite interface
+// using custom test patterns
+func InitCustomDisruptiveTestSuite(patterns []storageframework.TestPattern) storageframework.TestSuite {
 	return &disruptiveTestSuite{
-		tsInfo: TestSuiteInfo{
-			Name:       "disruptive",
-			FeatureTag: "[Disruptive][LinuxOnly]",
-			TestPatterns: []testpatterns.TestPattern{
-				// FSVolMode is already covered in subpath testsuite
-				testpatterns.DefaultFsInlineVolume,
-				testpatterns.FsVolModePreprovisionedPV,
-				testpatterns.FsVolModeDynamicPV,
-				testpatterns.BlockVolModePreprovisionedPV,
-				testpatterns.BlockVolModeDynamicPV,
-			},
+		tsInfo: storageframework.TestSuiteInfo{
+			Name:         "disruptive",
+			FeatureTag:   "[Disruptive][LinuxOnly]",
+			TestPatterns: patterns,
 		},
 	}
 }
-func (s *disruptiveTestSuite) GetTestSuiteInfo() TestSuiteInfo {
+
+// InitDisruptiveTestSuite returns subPathTestSuite that implements TestSuite interface
+// using test suite default patterns
+func InitDisruptiveTestSuite() storageframework.TestSuite {
+	testPatterns := []storageframework.TestPattern{
+		// FSVolMode is already covered in subpath testsuite
+		storageframework.DefaultFsInlineVolume,
+		storageframework.FsVolModePreprovisionedPV,
+		storageframework.FsVolModeDynamicPV,
+		storageframework.BlockVolModePreprovisionedPV,
+		storageframework.BlockVolModeDynamicPV,
+	}
+	return InitCustomDisruptiveTestSuite(testPatterns)
+}
+
+func (s *disruptiveTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInfo {
 	return s.tsInfo
 }
 
-func (s *disruptiveTestSuite) SkipRedundantSuite(driver TestDriver, pattern testpatterns.TestPattern) {
-	skipVolTypePatterns(pattern, driver, testpatterns.NewVolTypeMap(testpatterns.PreprovisionedPV))
+func (s *disruptiveTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+	skipVolTypePatterns(pattern, driver, storageframework.NewVolTypeMap(storageframework.PreprovisionedPV))
+	if pattern.VolMode == v1.PersistentVolumeBlock && !driver.GetDriverInfo().Capabilities[storageframework.CapBlock] {
+		e2eskipper.Skipf("Driver %s doesn't support %v -- skipping", driver.GetDriverInfo().Name, pattern.VolMode)
+	}
 }
 
-func (s *disruptiveTestSuite) DefineTests(driver TestDriver, pattern testpatterns.TestPattern) {
+func (s *disruptiveTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
 	type local struct {
-		config        *PerTestConfig
+		config        *storageframework.PerTestConfig
 		driverCleanup func()
 
 		cs clientset.Interface
 		ns *v1.Namespace
 
 		// VolumeResource contains pv, pvc, sc, etc., owns cleaning that up
-		resource *VolumeResource
+		resource *storageframework.VolumeResource
 		pod      *v1.Pod
 	}
 	var l local
 
-	// No preconditions to test. Normally they would be in a BeforeEach here.
-
-	// This intentionally comes after checking the preconditions because it
-	// registers its own BeforeEach which creates the namespace. Beware that it
-	// also registers an AfterEach which renders f unusable. Any code using
+	// Beware that it also registers an AfterEach which renders f unusable. Any code using
 	// f must run inside an It or Context callback.
-	f := framework.NewDefaultFramework("disruptive")
+	f := framework.NewFrameworkWithCustomTimeouts("disruptive", storageframework.GetDriverTimeouts(driver))
+	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
 	init := func() {
 		l = local{}
@@ -92,12 +99,8 @@ func (s *disruptiveTestSuite) DefineTests(driver TestDriver, pattern testpattern
 		// Now do the more expensive test initialization.
 		l.config, l.driverCleanup = driver.PrepareTest(f)
 
-		if pattern.VolMode == v1.PersistentVolumeBlock && !driver.GetDriverInfo().Capabilities[CapBlock] {
-			e2eskipper.Skipf("Driver %s doesn't support %v -- skipping", driver.GetDriverInfo().Name, pattern.VolMode)
-		}
-
 		testVolumeSizeRange := s.GetTestSuiteInfo().SupportedSizeRange
-		l.resource = CreateVolumeResource(driver, l.config, pattern, testVolumeSizeRange)
+		l.resource = storageframework.CreateVolumeResource(driver, l.config, pattern, testVolumeSizeRange)
 	}
 
 	cleanup := func() {
@@ -115,7 +118,7 @@ func (s *disruptiveTestSuite) DefineTests(driver TestDriver, pattern testpattern
 			l.resource = nil
 		}
 
-		errs = append(errs, tryFunc(l.driverCleanup))
+		errs = append(errs, storageutils.TryFunc(l.driverCleanup))
 		l.driverCleanup = nil
 		framework.ExpectNoError(errors.NewAggregate(errs), "while cleaning up resource")
 	}
@@ -129,18 +132,18 @@ func (s *disruptiveTestSuite) DefineTests(driver TestDriver, pattern testpattern
 	disruptiveTestTable := []disruptiveTest{
 		{
 			testItStmt:   "Should test that pv written before kubelet restart is readable after restart.",
-			runTestFile:  utils.TestKubeletRestartsAndRestoresMount,
-			runTestBlock: utils.TestKubeletRestartsAndRestoresMap,
+			runTestFile:  storageutils.TestKubeletRestartsAndRestoresMount,
+			runTestBlock: storageutils.TestKubeletRestartsAndRestoresMap,
 		},
 		{
 			testItStmt: "Should test that pv used in a pod that is deleted while the kubelet is down cleans up when the kubelet returns.",
 			// File test is covered by subpath testsuite
-			runTestBlock: utils.TestVolumeUnmapsFromDeletedPod,
+			runTestBlock: storageutils.TestVolumeUnmapsFromDeletedPod,
 		},
 		{
 			testItStmt: "Should test that pv used in a pod that is force deleted while the kubelet is down cleans up when the kubelet returns.",
 			// File test is covered by subpath testsuite
-			runTestBlock: utils.TestVolumeUnmapsFromForceDeletedPod,
+			runTestBlock: storageutils.TestVolumeUnmapsFromForceDeletedPod,
 		},
 	}
 
@@ -155,7 +158,7 @@ func (s *disruptiveTestSuite) DefineTests(driver TestDriver, pattern testpattern
 					var err error
 					var pvcs []*v1.PersistentVolumeClaim
 					var inlineSources []*v1.VolumeSource
-					if pattern.VolType == testpatterns.InlineVolume {
+					if pattern.VolType == storageframework.InlineVolume {
 						inlineSources = append(inlineSources, l.resource.VolSource)
 					} else {
 						pvcs = append(pvcs, l.resource.Pvc)
@@ -167,9 +170,9 @@ func (s *disruptiveTestSuite) DefineTests(driver TestDriver, pattern testpattern
 						InlineVolumeSources: inlineSources,
 						SeLinuxLabel:        e2epv.SELinuxLabel,
 						NodeSelection:       l.config.ClientNodeSelection,
-						ImageID:             e2evolume.GetDefaultTestImageID(),
+						ImageID:             e2epod.GetDefaultTestImageID(),
 					}
-					l.pod, err = e2epod.CreateSecPodWithNodeSelection(l.cs, &podConfig, framework.PodStartTimeout)
+					l.pod, err = e2epod.CreateSecPodWithNodeSelection(l.cs, &podConfig, f.Timeouts.PodStart)
 					framework.ExpectNoError(err, "While creating pods for kubelet restart test")
 
 					if pattern.VolMode == v1.PersistentVolumeBlock && t.runTestBlock != nil {

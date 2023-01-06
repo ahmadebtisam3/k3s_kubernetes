@@ -23,14 +23,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	api "k8s.io/api/core/v1"
+	storage "k8s.io/api/storage/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	utilstrings "k8s.io/utils/strings"
 )
@@ -149,7 +149,7 @@ func getSourceFromSpec(spec *volume.Spec) (*api.CSIVolumeSource, *api.CSIPersist
 	if spec.Volume != nil && spec.PersistentVolume != nil {
 		return nil, nil, fmt.Errorf("volume.Spec has both volume and persistent volume sources")
 	}
-	if spec.Volume != nil && spec.Volume.CSI != nil && utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume) {
+	if spec.Volume != nil && spec.Volume.CSI != nil {
 		return spec.Volume.CSI, nil, nil
 	}
 	if spec.PersistentVolume != nil &&
@@ -185,11 +185,32 @@ func GetCSIDriverName(spec *volume.Spec) (string, error) {
 	}
 
 	switch {
-	case volSrc != nil && utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume):
+	case volSrc != nil:
 		return volSrc.Driver, nil
 	case pvSrc != nil:
 		return pvSrc.Driver, nil
 	default:
 		return "", errors.New(log("volume source not found in volume.Spec"))
 	}
+}
+
+func createCSIOperationContext(volumeSpec *volume.Spec, timeout time.Duration) (context.Context, context.CancelFunc) {
+	migrated := false
+	if volumeSpec != nil {
+		migrated = volumeSpec.Migrated
+	}
+	ctx := context.WithValue(context.Background(), additionalInfoKey, additionalInfo{Migrated: strconv.FormatBool(migrated)})
+	return context.WithTimeout(ctx, timeout)
+}
+
+// getPodInfoAttrs returns pod info for NodePublish
+func getPodInfoAttrs(pod *api.Pod, volumeMode storage.VolumeLifecycleMode) map[string]string {
+	attrs := map[string]string{
+		"csi.storage.k8s.io/pod.name":            pod.Name,
+		"csi.storage.k8s.io/pod.namespace":       pod.Namespace,
+		"csi.storage.k8s.io/pod.uid":             string(pod.UID),
+		"csi.storage.k8s.io/serviceAccount.name": pod.Spec.ServiceAccountName,
+		"csi.storage.k8s.io/ephemeral":           strconv.FormatBool(volumeMode == storage.VolumeLifecycleEphemeral),
+	}
+	return attrs
 }

@@ -119,6 +119,9 @@ type KubeControllerManagerConfiguration struct {
 	// EndpointSliceMirroringControllerConfiguration holds configuration for
 	// EndpointSliceMirroringController related features.
 	EndpointSliceMirroringController EndpointSliceMirroringControllerConfiguration
+	// EphemeralVolumeControllerConfiguration holds configuration for EphemeralVolumeController
+	// related features.
+	EphemeralVolumeController EphemeralVolumeControllerConfiguration
 	// GarbageCollectorControllerConfiguration holds configuration for
 	// GarbageCollectorController related features.
 	GarbageCollectorController GarbageCollectorControllerConfiguration
@@ -193,8 +196,8 @@ type CSRSigningControllerConfiguration struct {
 	// legacyUnknownSignerConfiguration holds the certificate and key used to issue certificates for the kubernetes.io/legacy-unknown
 	LegacyUnknownSignerConfiguration CSRSigningConfiguration
 
-	// clusterSigningDuration is the length of duration signed certificates
-	// will be given.
+	// clusterSigningDuration is the max length of duration signed certificates will be given.
+	// Individual CSRs may request shorter certs by setting spec.expirationSeconds.
 	ClusterSigningDuration metav1.Duration
 }
 
@@ -222,8 +225,6 @@ type DeploymentControllerConfiguration struct {
 	// allowed to sync concurrently. Larger number = more responsive deployments,
 	// but more CPU (and network) load.
 	ConcurrentDeploymentSyncs int32
-	// deploymentControllerSyncPeriod is the period for syncing the deployments.
-	DeploymentControllerSyncPeriod metav1.Duration
 }
 
 // StatefulSetControllerConfiguration contains elements describing StatefulSetController.
@@ -236,15 +237,6 @@ type StatefulSetControllerConfiguration struct {
 
 // DeprecatedControllerConfiguration contains elements be deprecated.
 type DeprecatedControllerConfiguration struct {
-	// DEPRECATED: deletingPodsQps is the number of nodes per second on which pods are deleted in
-	// case of node failure.
-	DeletingPodsQPS float32
-	// DEPRECATED: deletingPodsBurst is the number of nodes on which pods are bursty deleted in
-	// case of node failure. For more details look into RateLimiter.
-	DeletingPodsBurst int32
-	// registerRetryCount is the number of retries for initial node registration.
-	// Retry interval equals node-sync-period.
-	RegisterRetryCount int32
 }
 
 // EndpointControllerConfiguration contains elements describing EndpointController.
@@ -300,6 +292,14 @@ type EndpointSliceMirroringControllerConfiguration struct {
 	MirroringEndpointUpdatesBatchPeriod metav1.Duration
 }
 
+// EphemeralVolumeControllerConfiguration contains elements describing EphemeralVolumeController.
+type EphemeralVolumeControllerConfiguration struct {
+	// ConcurrentEphemeralVolumeSyncseSyncs is the number of ephemeral volume syncing operations
+	// that will be done concurrently. Larger number = faster ephemeral volume updating,
+	// but more CPU (and network) load.
+	ConcurrentEphemeralVolumeSyncs int32
+}
+
 // GarbageCollectorControllerConfiguration contains elements describing GarbageCollectorController.
 type GarbageCollectorControllerConfiguration struct {
 	// enables the generic garbage collector. MUST be synced with the
@@ -328,10 +328,6 @@ type HPAControllerConfiguration struct {
 	// HorizontalPodAutoscalerTolerance is the tolerance for when
 	// resource usage suggests upscaling/downscaling
 	HorizontalPodAutoscalerTolerance float64
-	// HorizontalPodAutoscalerUseRESTClients causes the HPA controller to use REST clients
-	// through the kube-aggregator when enabled, instead of using the legacy metrics client
-	// through the API server proxy.
-	HorizontalPodAutoscalerUseRESTClients *bool
 	// HorizontalPodAutoscalerCPUInitializationPeriod is the period after pod start when CPU samples
 	// might be skipped.
 	HorizontalPodAutoscalerCPUInitializationPeriod metav1.Duration

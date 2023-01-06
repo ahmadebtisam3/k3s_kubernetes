@@ -20,13 +20,15 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -36,35 +38,54 @@ import (
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	testutils "k8s.io/kubernetes/test/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
 )
 
 var _ = SIGDescribe("Multi-AZ Clusters", func() {
 	f := framework.NewDefaultFramework("multi-az")
+	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelBaseline
 	var zoneCount int
 	var err error
+	var cleanUp func()
+	var zoneNames sets.String
 	ginkgo.BeforeEach(func() {
-		e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws")
+		cs := f.ClientSet
+
 		if zoneCount <= 0 {
-			zoneCount, err = getZoneCount(f.ClientSet)
+			zoneNames, err = e2enode.GetSchedulableClusterZones(cs)
 			framework.ExpectNoError(err)
+			zoneCount = len(zoneNames)
 		}
-		ginkgo.By(fmt.Sprintf("Checking for multi-zone cluster.  Zone count = %d", zoneCount))
-		msg := fmt.Sprintf("Zone count is %d, only run for multi-zone clusters, skipping test", zoneCount)
+		ginkgo.By(fmt.Sprintf("Checking for multi-zone cluster. Schedulable zone count = %d", zoneCount))
+		msg := fmt.Sprintf("Schedulable zone count is %d, only run for multi-zone clusters, skipping test", zoneCount)
 		e2eskipper.SkipUnlessAtLeast(zoneCount, 2, msg)
 		// TODO: SkipUnlessDefaultScheduler() // Non-default schedulers might not spread
+
+		e2enode.WaitForTotalHealthy(cs, time.Minute)
+		nodeList, err := e2enode.GetReadySchedulableNodes(cs)
+		framework.ExpectNoError(err)
+
+		// make the nodes have balanced cpu,mem usage
+		cleanUp, err = createBalancedPodForNodes(f, cs, f.Namespace.Name, nodeList.Items, podRequestedResource, 0.0)
+		framework.ExpectNoError(err)
 	})
-	ginkgo.It("should spread the pods of a service across zones", func() {
-		SpreadServiceOrFail(f, 5*zoneCount, imageutils.GetPauseImageName())
+	ginkgo.AfterEach(func() {
+		if cleanUp != nil {
+			cleanUp()
+		}
+	})
+	ginkgo.It("should spread the pods of a service across zones [Serial]", func() {
+		SpreadServiceOrFail(f, 5*zoneCount, zoneNames, imageutils.GetPauseImageName())
 	})
 
-	ginkgo.It("should spread the pods of a replication controller across zones", func() {
-		SpreadRCOrFail(f, int32(5*zoneCount), framework.ServeHostnameImage, []string{"serve-hostname"})
+	ginkgo.It("should spread the pods of a replication controller across zones [Serial]", func() {
+		SpreadRCOrFail(f, int32(5*zoneCount), zoneNames, framework.ServeHostnameImage, []string{"serve-hostname"})
 	})
 })
 
 // SpreadServiceOrFail check that the pods comprising a service
 // get spread evenly across available zones
-func SpreadServiceOrFail(f *framework.Framework, replicaCount int, image string) {
+func SpreadServiceOrFail(f *framework.Framework, replicaCount int, zoneNames sets.String, image string) {
 	// First create the service
 	serviceName := "test-service"
 	serviceSpec := &v1.Service{
@@ -113,29 +134,18 @@ func SpreadServiceOrFail(f *framework.Framework, replicaCount int, image string)
 	framework.ExpectNoError(err)
 
 	// Now make sure they're spread across zones
-	zoneNames, err := e2enode.GetClusterZones(f.ClientSet)
-	framework.ExpectNoError(err)
 	checkZoneSpreading(f.ClientSet, pods, zoneNames.List())
 }
 
 // Find the name of the zone in which a Node is running
 func getZoneNameForNode(node v1.Node) (string, error) {
-	for key, value := range node.Labels {
-		if key == v1.LabelFailureDomainBetaZone {
-			return value, nil
-		}
+	if z, ok := node.Labels[v1.LabelFailureDomainBetaZone]; ok {
+		return z, nil
+	} else if z, ok := node.Labels[v1.LabelTopologyZone]; ok {
+		return z, nil
 	}
-	return "", fmt.Errorf("node %s doesn't have zone label %s",
-		node.Name, v1.LabelFailureDomainBetaZone)
-}
-
-// Return the number of zones in which we have nodes in this cluster.
-func getZoneCount(c clientset.Interface) (int, error) {
-	zoneNames, err := e2enode.GetClusterZones(c)
-	if err != nil {
-		return -1, err
-	}
-	return len(zoneNames), nil
+	return "", fmt.Errorf("node %s doesn't have zone label %s or %s",
+		node.Name, v1.LabelFailureDomainBetaZone, v1.LabelTopologyZone)
 }
 
 // Find the name of the zone in which the pod is scheduled
@@ -178,7 +188,7 @@ func checkZoneSpreading(c clientset.Interface, pods *v1.PodList, zoneNames []str
 
 // SpreadRCOrFail Check that the pods comprising a replication
 // controller get spread evenly across available zones
-func SpreadRCOrFail(f *framework.Framework, replicaCount int32, image string, args []string) {
+func SpreadRCOrFail(f *framework.Framework, replicaCount int32, zoneNames sets.String, image string, args []string) {
 	name := "ubelite-spread-rc-" + string(uuid.NewUUID())
 	ginkgo.By(fmt.Sprintf("Creating replication controller %s", name))
 	controller, err := f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Create(context.TODO(), &v1.ReplicationController{
@@ -227,7 +237,5 @@ func SpreadRCOrFail(f *framework.Framework, replicaCount int32, image string, ar
 	framework.ExpectNoError(err)
 
 	// Now make sure they're spread across zones
-	zoneNames, err := e2enode.GetClusterZones(f.ClientSet)
-	framework.ExpectNoError(err)
 	checkZoneSpreading(f.ClientSet, pods, zoneNames.List())
 }

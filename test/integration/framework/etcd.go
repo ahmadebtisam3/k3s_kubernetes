@@ -18,20 +18,21 @@ package framework
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
-	"go.etcd.io/etcd/clientv3"
 	"google.golang.org/grpc/grpclog"
 	"k8s.io/klog/v2"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/util/env"
 )
 
@@ -47,12 +48,6 @@ You can use 'hack/install-etcd.sh' to install a copy in third_party/.
 
 // getEtcdPath returns a path to an etcd executable.
 func getEtcdPath() (string, error) {
-	bazelPath := filepath.Join(os.Getenv("RUNFILES_DIR"), fmt.Sprintf("com_coreos_etcd_%s", runtime.GOARCH), "etcd")
-
-	p, err := exec.LookPath(bazelPath)
-	if err == nil {
-		return p, nil
-	}
 	return exec.LookPath("etcd")
 }
 
@@ -100,7 +95,7 @@ func RunCustomEtcd(dataDir string, customFlags []string) (url string, stopFn fun
 	// TODO: Check for valid etcd version.
 	etcdPath, err := getEtcdPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, installEtcd)
+		fmt.Fprint(os.Stderr, installEtcd)
 		return "", nil, fmt.Errorf("could not find etcd in PATH: %v", err)
 	}
 	etcdPort, err := getAvailablePort()
@@ -111,7 +106,7 @@ func RunCustomEtcd(dataDir string, customFlags []string) (url string, stopFn fun
 
 	klog.Infof("starting etcd on %s", customURL)
 
-	etcdDataDir, err := ioutil.TempDir(os.TempDir(), dataDir)
+	etcdDataDir, err := os.MkdirTemp(os.TempDir(), dataDir)
 	if err != nil {
 		return "", nil, fmt.Errorf("unable to make temp etcd data dir %s: %v", dataDir, err)
 	}
@@ -127,15 +122,26 @@ func RunCustomEtcd(dataDir string, customFlags []string) (url string, stopFn fun
 		customURL,
 		"--listen-peer-urls",
 		"http://127.0.0.1:0",
-		"--log-package-levels",
-		"*=NOTICE", // set to INFO or DEBUG for more logs
+		"-log-level",
+		"warn", // set to info or debug for more logs
 	}
 	args = append(args, customFlags...)
 	cmd := exec.CommandContext(ctx, etcdPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	stop := func() {
-		cancel()
+		// try to exit etcd gracefully
+		defer cancel()
+		cmd.Process.Signal(syscall.SIGTERM)
+		go func() {
+			select {
+			case <-ctx.Done():
+				klog.Infof("etcd exited gracefully, context cancelled")
+			case <-time.After(5 * time.Second):
+				klog.Infof("etcd didn't exit in 5 seconds, killing it")
+				cancel()
+			}
+		}()
 		err := cmd.Wait()
 		klog.Infof("etcd exit status: %v", err)
 		err = os.RemoveAll(etcdDataDir)
@@ -146,7 +152,7 @@ func RunCustomEtcd(dataDir string, customFlags []string) (url string, stopFn fun
 
 	// Quiet etcd logs for integration tests
 	// Comment out to get verbose logs if desired
-	clientv3.SetLogger(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, os.Stderr))
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, os.Stderr))
 
 	if err := cmd.Start(); err != nil {
 		return "", nil, fmt.Errorf("failed to run etcd: %v", err)
@@ -176,12 +182,36 @@ func RunCustomEtcd(dataDir string, customFlags []string) (url string, stopFn fun
 
 // EtcdMain starts an etcd instance before running tests.
 func EtcdMain(tests func() int) {
+	// Bail out early when -help was given as parameter.
+	flag.Parse()
+
+	before := runtime.NumGoroutine()
 	stop, err := startEtcd()
 	if err != nil {
 		klog.Fatalf("cannot run integration tests: unable to start etcd: %v", err)
 	}
 	result := tests()
 	stop() // Don't defer this. See os.Exit documentation.
+
+	checkNumberOfGoroutines := func() (bool, error) {
+		// Leave some room for goroutines we can not get rid of
+		// like k8s.io/klog/v2.(*loggingT).flushDaemon()
+		// TODO(#108483): Reduce this number once we address the
+		//   couple remaining issues.
+		if dg := runtime.NumGoroutine() - before; dg <= 15 {
+			return true, nil
+		}
+		// Allow goroutines to schedule and die off.
+		runtime.Gosched()
+		return false, nil
+	}
+
+	// It generally takes visibly less than 1s to finish all goroutines.
+	// But we keep the limit higher to account for cpu-starved environments.
+	if err := wait.Poll(100*time.Millisecond, 5*time.Second, checkNumberOfGoroutines); err != nil {
+		after := runtime.NumGoroutine()
+		klog.Fatalf("unexpected number of goroutines: before: %d after %d", before, after)
+	}
 	os.Exit(result)
 }
 

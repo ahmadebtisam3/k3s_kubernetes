@@ -133,7 +133,7 @@ func (plugin *flexVolumePlugin) GetVolumeName(spec *volume.Spec) (string, error)
 		return "", err
 	}
 
-	klog.V(4).Infof(logPrefix(plugin), "GetVolumeName is not supported yet. Defaulting to PV or volume name: ", name)
+	klog.V(4).Info(logPrefix(plugin), "GetVolumeName is not supported yet. Defaulting to PV or volume name: ", name)
 
 	return name, nil
 }
@@ -285,6 +285,10 @@ func (plugin *flexVolumePlugin) unsupported(commands ...string) {
 
 func (plugin *flexVolumePlugin) SupportsBulkVolumeVerification() bool {
 	return false
+}
+
+func (plugin *flexVolumePlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
 // Returns true iff the given command is known to be unsupported.

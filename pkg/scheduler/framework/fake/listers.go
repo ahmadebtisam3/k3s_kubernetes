@@ -22,6 +22,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	appslisters "k8s.io/client-go/listers/apps/v1"
@@ -124,7 +125,8 @@ func (f ReplicaSetLister) GetPodReplicaSets(pod *v1.Pod) (rss []*appsv1.ReplicaS
 		}
 		selector, err = metav1.LabelSelectorAsSelector(rs.Spec.Selector)
 		if err != nil {
-			return
+			// This object has an invalid selector, it does not match the pod
+			continue
 		}
 
 		if selector.Matches(labels.Set(pod.Labels)) {
@@ -163,7 +165,8 @@ func (f StatefulSetLister) GetPodStatefulSets(pod *v1.Pod) (sss []*appsv1.Statef
 		}
 		selector, err = metav1.LabelSelectorAsSelector(ss.Spec.Selector)
 		if err != nil {
-			return
+			// This object has an invalid selector, it does not match the pod
+			continue
 		}
 		if selector.Matches(labels.Set(pod.Labels)) {
 			sss = append(sss, ss)
@@ -251,18 +254,6 @@ func (nodes NodeInfoLister) HavePodsWithRequiredAntiAffinityList() ([]*framework
 	return nodes, nil
 }
 
-// NewNodeInfoLister create a new fake NodeInfoLister from a slice of v1.Nodes.
-func NewNodeInfoLister(nodes []*v1.Node) framework.NodeInfoLister {
-	nodeInfoList := make([]*framework.NodeInfo, len(nodes))
-	for _, node := range nodes {
-		nodeInfo := framework.NewNodeInfo()
-		nodeInfo.SetNode(node)
-		nodeInfoList = append(nodeInfoList, nodeInfo)
-	}
-
-	return NodeInfoLister(nodeInfoList)
-}
-
 var _ storagelisters.CSINodeLister = CSINodeLister{}
 
 // CSINodeLister declares a storagev1.CSINode type for testing.
@@ -311,7 +302,12 @@ func (classes StorageClassLister) Get(name string) (*storagev1.StorageClass, err
 			return &sc, nil
 		}
 	}
-	return nil, fmt.Errorf("unable to find storage class: %s", name)
+	return nil, &errors.StatusError{
+		ErrStatus: metav1.Status{
+			Reason:  metav1.StatusReasonNotFound,
+			Message: fmt.Sprintf("unable to find storage class: %s", name),
+		},
+	}
 }
 
 // List lists all StorageClass in the indexer.

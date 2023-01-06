@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -21,6 +22,7 @@ package azure
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"path"
 	"strconv"
 	"strings"
@@ -44,7 +46,7 @@ const (
 	diskEncryptionSetIDFormat = "/subscriptions/{subs-id}/resourceGroups/{rg-name}/providers/Microsoft.Compute/diskEncryptionSets/{diskEncryptionSet-name}"
 )
 
-//ManagedDiskController : managed disk controller struct
+// ManagedDiskController : managed disk controller struct
 type ManagedDiskController struct {
 	common *controllerCommon
 }
@@ -79,7 +81,7 @@ type ManagedDiskOptions struct {
 	MaxShares int32
 }
 
-//CreateManagedDisk : create managed disk
+// CreateManagedDisk : create managed disk
 func (c *ManagedDiskController) CreateManagedDisk(options *ManagedDiskOptions) (string, error) {
 	var err error
 	klog.V(4).Infof("azureDisk - creating new managed Name:%s StorageAccountType:%s Size:%v", options.DiskName, options.StorageAccountType, options.SizeGB)
@@ -210,7 +212,7 @@ func (c *ManagedDiskController) CreateManagedDisk(options *ManagedDiskOptions) (
 	return diskID, nil
 }
 
-//DeleteManagedDisk : delete managed disk
+// DeleteManagedDisk : delete managed disk
 func (c *ManagedDiskController) DeleteManagedDisk(diskURI string) error {
 	diskName := path.Base(diskURI)
 	resourceGroup, err := getResourceGroupFromDiskURI(diskURI)
@@ -227,6 +229,10 @@ func (c *ManagedDiskController) DeleteManagedDisk(diskURI string) error {
 
 	disk, rerr := c.common.cloud.DisksClient.Get(ctx, resourceGroup, diskName)
 	if rerr != nil {
+		if rerr.HTTPStatusCode == http.StatusNotFound {
+			klog.V(2).Infof("azureDisk - disk(%s) is already deleted", diskURI)
+			return nil
+		}
 		return rerr.Error()
 	}
 
@@ -236,6 +242,10 @@ func (c *ManagedDiskController) DeleteManagedDisk(diskURI string) error {
 
 	rerr = c.common.cloud.DisksClient.Delete(ctx, resourceGroup, diskName)
 	if rerr != nil {
+		if rerr.HTTPStatusCode == http.StatusNotFound {
+			klog.V(2).Infof("azureDisk - disk(%s) is already deleted", diskURI)
+			return nil
+		}
 		return rerr.Error()
 	}
 	// We don't need poll here, k8s will immediately stop referencing the disk
@@ -355,7 +365,7 @@ func (c *Cloud) GetAzureDiskLabels(diskURI string) (map[string]string, error) {
 	}
 
 	labels := map[string]string{
-		LabelFailureDomainBetaRegion: c.Location,
+		v1.LabelTopologyRegion: c.Location,
 	}
 	// no azure credential is set, return nil
 	if c.DisksClient == nil {
@@ -384,6 +394,6 @@ func (c *Cloud) GetAzureDiskLabels(diskURI string) (map[string]string, error) {
 
 	zone := c.makeZone(c.Location, zoneID)
 	klog.V(4).Infof("Got zone %q for Azure disk %q", zone, diskName)
-	labels[LabelFailureDomainBetaZone] = zone
+	labels[v1.LabelTopologyZone] = zone
 	return labels, nil
 }

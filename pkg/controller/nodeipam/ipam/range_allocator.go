@@ -21,8 +21,9 @@ import (
 	"net"
 	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,17 +36,10 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	nodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam/cidrset"
-	nodeutil "k8s.io/kubernetes/pkg/controller/util/node"
-	utilnode "k8s.io/kubernetes/pkg/util/node"
+	controllerutil "k8s.io/kubernetes/pkg/controller/util/node"
 )
-
-// cidrs are reserved, then node resource is patched with them
-// this type holds the reservation info for a node
-type nodeReservedCIDRs struct {
-	allocatedCIDRs []*net.IPNet
-	nodeName       string
-}
 
 type rangeAllocator struct {
 	client clientset.Interface
@@ -134,8 +128,8 @@ func NewCIDRRangeAllocator(client clientset.Interface, nodeInformer informers.No
 	}
 
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: nodeutil.CreateAddNodeHandler(ra.AllocateOrOccupyCIDR),
-		UpdateFunc: nodeutil.CreateUpdateNodeHandler(func(_, newNode *v1.Node) error {
+		AddFunc: controllerutil.CreateAddNodeHandler(ra.AllocateOrOccupyCIDR),
+		UpdateFunc: controllerutil.CreateUpdateNodeHandler(func(_, newNode *v1.Node) error {
 			// If the PodCIDRs list is not empty we either:
 			// - already processed a Node that already had CIDRs after NC restarted
 			//   (cidr is marked as used),
@@ -160,7 +154,7 @@ func NewCIDRRangeAllocator(client clientset.Interface, nodeInformer informers.No
 			}
 			return nil
 		}),
-		DeleteFunc: nodeutil.CreateDeleteNodeHandler(ra.ReleaseCIDR),
+		DeleteFunc: controllerutil.CreateDeleteNodeHandler(ra.ReleaseCIDR),
 	})
 
 	return ra, nil
@@ -224,7 +218,7 @@ func (r *rangeAllocator) occupyCIDRs(node *v1.Node) error {
 		return nil
 	}
 	for idx, cidr := range node.Spec.PodCIDRs {
-		_, podCIDR, err := net.ParseCIDR(cidr)
+		_, podCIDR, err := netutils.ParseCIDRSloppy(cidr)
 		if err != nil {
 			return fmt.Errorf("failed to parse node %s, CIDR %s", node.Name, node.Spec.PodCIDR)
 		}
@@ -267,7 +261,7 @@ func (r *rangeAllocator) AllocateOrOccupyCIDR(node *v1.Node) error {
 		podCIDR, err := r.cidrSets[idx].AllocateNext()
 		if err != nil {
 			r.removeNodeFromProcessing(node.Name)
-			nodeutil.RecordNodeStatusChange(r.recorder, node, "CIDRNotAvailable")
+			controllerutil.RecordNodeStatusChange(r.recorder, node, "CIDRNotAvailable")
 			return fmt.Errorf("failed to allocate cidr from cluster cidr at idx:%v: %v", idx, err)
 		}
 		allocated.allocatedCIDRs[idx] = podCIDR
@@ -286,7 +280,7 @@ func (r *rangeAllocator) ReleaseCIDR(node *v1.Node) error {
 	}
 
 	for idx, cidr := range node.Spec.PodCIDRs {
-		_, podCIDR, err := net.ParseCIDR(cidr)
+		_, podCIDR, err := netutils.ParseCIDRSloppy(cidr)
 		if err != nil {
 			return fmt.Errorf("failed to parse CIDR %s on Node %v: %v", cidr, node.Name, err)
 		}
@@ -332,7 +326,7 @@ func (r *rangeAllocator) updateCIDRsAllocation(data nodeReservedCIDRs) error {
 	var err error
 	var node *v1.Node
 	defer r.removeNodeFromProcessing(data.nodeName)
-	cidrsString := cidrsAsString(data.allocatedCIDRs)
+	cidrsString := ipnetToStringList(data.allocatedCIDRs)
 	node, err = r.nodeLister.Get(data.nodeName)
 	if err != nil {
 		klog.Errorf("Failed while getting node %v for updating Node.Spec.PodCIDRs: %v", data.nodeName, err)
@@ -369,14 +363,14 @@ func (r *rangeAllocator) updateCIDRsAllocation(data nodeReservedCIDRs) error {
 
 	// If we reached here, it means that the node has no CIDR currently assigned. So we set it.
 	for i := 0; i < cidrUpdateRetries; i++ {
-		if err = utilnode.PatchNodeCIDRs(r.client, types.NodeName(node.Name), cidrsString); err == nil {
+		if err = nodeutil.PatchNodeCIDRs(r.client, types.NodeName(node.Name), cidrsString); err == nil {
 			klog.Infof("Set node %v PodCIDR to %v", node.Name, cidrsString)
 			return nil
 		}
 	}
 	// failed release back to the pool
 	klog.Errorf("Failed to update node %v PodCIDR to %v after multiple attempts: %v", node.Name, cidrsString, err)
-	nodeutil.RecordNodeStatusChange(r.recorder, node, "CIDRAssignmentFailed")
+	controllerutil.RecordNodeStatusChange(r.recorder, node, "CIDRAssignmentFailed")
 	// We accept the fact that we may leak CIDRs here. This is safer than releasing
 	// them in case when we don't know if request went through.
 	// NodeController restart will return all falsely allocated CIDRs to the pool.
@@ -389,13 +383,4 @@ func (r *rangeAllocator) updateCIDRsAllocation(data nodeReservedCIDRs) error {
 		}
 	}
 	return err
-}
-
-// converts a slice of cidrs into <c-1>,<c-2>,<c-n>
-func cidrsAsString(inCIDRs []*net.IPNet) []string {
-	outCIDRs := make([]string, len(inCIDRs))
-	for idx, inCIDR := range inCIDRs {
-		outCIDRs[idx] = inCIDR.String()
-	}
-	return outCIDRs
 }

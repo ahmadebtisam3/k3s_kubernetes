@@ -35,6 +35,7 @@ EXCLUDED_PATTERNS=(
   "verify-linkcheck.sh"          # runs in separate Jenkins job once per day due to high network usage
   "verify-*-dockerized.sh"       # Don't run any scripts that intended to be run dockerized
   "verify-govet-levee.sh"        # Do not run levee analysis by default while KEP-1933 implementation is in alpha.
+  "verify-licenses.sh"           # runs in a separate job to monitor availability of the dependencies periodically
   )
 
 # Exclude generated-files-remake in certain cases, if they're running in a separate job.
@@ -49,7 +50,6 @@ if [[ ${EXCLUDE_TYPECHECK:-} =~ ^[yY]$ ]]; then
   EXCLUDED_PATTERNS+=(
     "verify-typecheck.sh"              # runs in separate typecheck job
     "verify-typecheck-providerless.sh" # runs in separate typecheck job
-    "verify-typecheck-dockerless.sh" # runs in separate typecheck job
     )
 fi
 
@@ -71,17 +71,16 @@ if [[ ${EXCLUDE_READONLY_PACKAGE:-} =~ ^[yY]$ ]]; then
     )
 fi
 
-# Only run whitelisted fast checks in quick mode.
-# These run in <10s each on enisoc's workstation, assuming that
-# `make` had already been run.
+# Only run known fast checks in quick mode.
+# These ideally run in less than 10s.
 QUICK_PATTERNS+=(
   "verify-api-groups.sh"
-  "verify-bazel.sh"
   "verify-boilerplate.sh"
   "verify-external-dependencies-version.sh"
   "verify-vendor-licenses.sh"
   "verify-gofmt.sh"
   "verify-imports.sh"
+  "verify-non-mutating-validation.sh"
   "verify-pkg-names.sh"
   "verify-readonly-packages.sh"
   "verify-spelling.sh"

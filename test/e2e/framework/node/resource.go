@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
 	v1 "k8s.io/api/core/v1"
@@ -377,6 +377,42 @@ func GetRandomReadySchedulableNode(c clientset.Interface) (*v1.Node, error) {
 	return &nodes.Items[rand.Intn(len(nodes.Items))], nil
 }
 
+// GetSubnetPrefix gets first 2 number of an IP in the node subnet. [IPv4]
+// It assumes that the subnet mask is /16.
+func GetSubnetPrefix(c clientset.Interface) ([]string, error) {
+	node, err := GetReadySchedulableWorkerNode(c)
+	if err != nil {
+		return nil, fmt.Errorf("error getting a ready schedulable worker Node, err: %v", err)
+	}
+	internalIP, err := GetInternalIP(node)
+	if err != nil {
+		return nil, fmt.Errorf("error getting Node internal IP, err: %v", err)
+	}
+	splitted := strings.Split(internalIP, ".")
+	if len(splitted) == 4 {
+		return splitted[:2], nil
+	}
+	return nil, fmt.Errorf("invalid IP address format: %s", internalIP)
+}
+
+// GetReadySchedulableWorkerNode gets a single worker node which is available for
+// running pods on. If there are no such available nodes it will return an error.
+func GetReadySchedulableWorkerNode(c clientset.Interface) (*v1.Node, error) {
+	nodes, err := GetReadySchedulableNodes(c)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nodes.Items {
+		node := nodes.Items[i]
+		_, isMaster := node.Labels["node-role.kubernetes.io/master"]
+		_, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
+		if !isMaster && !isControlPlane {
+			return &node, nil
+		}
+	}
+	return nil, fmt.Errorf("there are currently no ready, schedulable worker nodes in the cluster")
+}
+
 // GetReadyNodesIncludingTainted returns all ready nodes, even those which are tainted.
 // There are cases when we care about tainted nodes
 // E.g. in tests related to nodes with gpu we care about nodes despite
@@ -561,6 +597,28 @@ func GetClusterZones(c clientset.Interface) (sets.String, error) {
 	return zones, nil
 }
 
+// GetSchedulableClusterZones returns the values of zone label collected from all nodes which are schedulable.
+func GetSchedulableClusterZones(c clientset.Interface) (sets.String, error) {
+	// GetReadySchedulableNodes already filters our tainted and unschedulable nodes.
+	nodes, err := GetReadySchedulableNodes(c)
+	if err != nil {
+		return nil, fmt.Errorf("error getting nodes while attempting to list cluster zones: %v", err)
+	}
+
+	// collect values of zone label from all nodes
+	zones := sets.NewString()
+	for _, node := range nodes.Items {
+		if zone, found := node.Labels[v1.LabelFailureDomainBetaZone]; found {
+			zones.Insert(zone)
+		}
+
+		if zone, found := node.Labels[v1.LabelTopologyZone]; found {
+			zones.Insert(zone)
+		}
+	}
+	return zones, nil
+}
+
 // CreatePodsPerNodeForSimpleApp creates pods w/ labels.  Useful for tests which make a bunch of pods w/o any networking.
 func CreatePodsPerNodeForSimpleApp(c clientset.Interface, namespace, appName string, podSpec func(n v1.Node) v1.PodSpec, maxCount int) map[string]string {
 	nodes, err := GetBoundedReadySchedulableNodes(c, maxCount)
@@ -582,6 +640,14 @@ func CreatePodsPerNodeForSimpleApp(c clientset.Interface, namespace, appName str
 		gomega.ExpectWithOffset(2, err).NotTo(gomega.HaveOccurred())
 	}
 	return podLabels
+}
+
+// RemoveTaintsOffNode removes a list of taints from the given node
+// It is simply a helper wrapper for RemoveTaintOffNode
+func RemoveTaintsOffNode(c clientset.Interface, nodeName string, taints []v1.Taint) {
+	for _, taint := range taints {
+		RemoveTaintOffNode(c, nodeName, taint)
+	}
 }
 
 // RemoveTaintOffNode removes the given taint from the given node.

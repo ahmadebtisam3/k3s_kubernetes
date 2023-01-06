@@ -20,60 +20,49 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"net/http/httptest"
 	"runtime"
 	"testing"
 
 	"github.com/prometheus/common/model"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/component-base/metrics/testutil"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-func scrapeMetrics(s *httptest.Server) (testutil.Metrics, error) {
-	req, err := http.NewRequest("GET", s.URL+"/metrics", nil)
+func scrapeMetrics(s *kubeapiservertesting.TestServer) (testutil.Metrics, error) {
+	client, err := clientset.NewForConfig(s.ClientConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to create http request: %v", err)
+		return nil, fmt.Errorf("couldn't create client")
 	}
-	client := &http.Client{}
-	resp, err := client.Do(req)
+
+	body, err := client.RESTClient().Get().AbsPath("metrics").DoRaw(context.TODO())
 	if err != nil {
-		return nil, fmt.Errorf("Unable to contact metrics endpoint of master: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Non-200 response trying to scrape metrics from master: %v", resp)
+		return nil, fmt.Errorf("request failed: %v", err)
 	}
 	metrics := testutil.NewMetrics()
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("Unable to read response: %v", resp)
-	}
-	err = testutil.ParseMetrics(string(data), &metrics)
+	err = testutil.ParseMetrics(string(body), &metrics)
 	return metrics, err
 }
 
 func checkForExpectedMetrics(t *testing.T, metrics testutil.Metrics, expectedMetrics []string) {
 	for _, expected := range expectedMetrics {
 		if _, found := metrics[expected]; !found {
-			t.Errorf("Master metrics did not include expected metric %q", expected)
+			t.Errorf("API server metrics did not include expected metric %q", expected)
 		}
 	}
 }
 
-func TestMasterProcessMetrics(t *testing.T) {
+func TestAPIServerProcessMetrics(t *testing.T) {
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		t.Skipf("not supported on GOOS=%s", runtime.GOOS)
 	}
 
-	_, s, closeFn := framework.RunAMaster(nil)
-	defer closeFn()
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer s.TearDownFn()
 
 	metrics, err := scrapeMetrics(s)
 	if err != nil {
@@ -87,19 +76,19 @@ func TestMasterProcessMetrics(t *testing.T) {
 	})
 }
 
-func TestApiserverMetrics(t *testing.T) {
-	_, s, closeFn := framework.RunAMaster(nil)
-	defer closeFn()
+func TestAPIServerMetrics(t *testing.T) {
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer s.TearDownFn()
 
 	// Make a request to the apiserver to ensure there's at least one data point
 	// for the metrics we're expecting -- otherwise, they won't be exported.
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
+	client := clientset.NewForConfigOrDie(s.ClientConfig)
 	if _, err := client.CoreV1().Pods(metav1.NamespaceDefault).List(context.TODO(), metav1.ListOptions{}); err != nil {
 		t.Fatalf("unexpected error getting pods: %v", err)
 	}
 
 	// Make a request to a deprecated API to ensure there's at least one data point
-	if _, err := client.RbacV1beta1().Roles(metav1.NamespaceDefault).List(context.TODO(), metav1.ListOptions{}); err != nil {
+	if _, err := client.StorageV1beta1().CSIStorageCapacities("default").List(context.TODO(), metav1.ListOptions{}); err != nil {
 		t.Fatalf("unexpected error getting rbac roles: %v", err)
 	}
 
@@ -115,11 +104,14 @@ func TestApiserverMetrics(t *testing.T) {
 	})
 }
 
-func TestApiserverMetricsLabels(t *testing.T) {
-	_, s, closeFn := framework.RunAMaster(nil)
-	defer closeFn()
+func TestAPIServerMetricsLabels(t *testing.T) {
+	// Disable ServiceAccount admission plugin as we don't have service account controller running.
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
+	defer s.TearDownFn()
 
-	client, err := clientset.NewForConfig(&restclient.Config{Host: s.URL, QPS: -1})
+	clientConfig := restclient.CopyConfig(s.ClientConfig)
+	clientConfig.QPS = -1
+	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -242,7 +234,7 @@ func TestApiserverMetricsLabels(t *testing.T) {
 	}
 }
 
-func TestApiserverMetricsPods(t *testing.T) {
+func TestAPIServerMetricsPods(t *testing.T) {
 	callOrDie := func(_ interface{}, err error) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -266,10 +258,13 @@ func TestApiserverMetricsPods(t *testing.T) {
 		}
 	}
 
-	_, server, closeFn := framework.RunAMaster(framework.NewMasterConfig())
-	defer closeFn()
+	// Disable ServiceAccount admission plugin as we don't have service account controller running.
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
+	defer server.TearDownFn()
 
-	client, err := clientset.NewForConfig(&restclient.Config{Host: server.URL, QPS: -1})
+	clientConfig := restclient.CopyConfig(server.ClientConfig)
+	clientConfig.QPS = -1
+	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -287,42 +282,42 @@ func TestApiserverMetricsPods(t *testing.T) {
 			executor: func() {
 				callOrDie(c.Create(context.TODO(), makePod("foo"), metav1.CreateOptions{}))
 			},
-			want: `apiserver_request_total{code="201", component="apiserver", contentType="application/json", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="POST", version="v1"}`,
+			want: `apiserver_request_total{code="201", component="apiserver", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="POST", version="v1"}`,
 		},
 		{
 			name: "update pod",
 			executor: func() {
 				callOrDie(c.Update(context.TODO(), makePod("bar"), metav1.UpdateOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="PUT", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="PUT", version="v1"}`,
 		},
 		{
 			name: "update pod status",
 			executor: func() {
 				callOrDie(c.UpdateStatus(context.TODO(), makePod("bar"), metav1.UpdateOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="pods", scope="resource", subresource="status", verb="PUT", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="pods", scope="resource", subresource="status", verb="PUT", version="v1"}`,
 		},
 		{
 			name: "get pod",
 			executor: func() {
 				callOrDie(c.Get(context.TODO(), "foo", metav1.GetOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="GET", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="GET", version="v1"}`,
 		},
 		{
 			name: "list pod",
 			executor: func() {
 				callOrDie(c.List(context.TODO(), metav1.ListOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="pods", scope="namespace", subresource="", verb="LIST", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="pods", scope="namespace", subresource="", verb="LIST", version="v1"}`,
 		},
 		{
 			name: "delete pod",
 			executor: func() {
 				callOrDie(nil, c.Delete(context.TODO(), "foo", metav1.DeleteOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="DELETE", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="pods", scope="resource", subresource="", verb="DELETE", version="v1"}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -356,7 +351,7 @@ func TestApiserverMetricsPods(t *testing.T) {
 	}
 }
 
-func TestApiserverMetricsNamespaces(t *testing.T) {
+func TestAPIServerMetricsNamespaces(t *testing.T) {
 	callOrDie := func(_ interface{}, err error) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -372,10 +367,12 @@ func TestApiserverMetricsNamespaces(t *testing.T) {
 		}
 	}
 
-	_, server, closeFn := framework.RunAMaster(framework.NewMasterConfig())
-	defer closeFn()
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer server.TearDownFn()
 
-	client, err := clientset.NewForConfig(&restclient.Config{Host: server.URL, QPS: -1})
+	clientConfig := restclient.CopyConfig(server.ClientConfig)
+	clientConfig.QPS = -1
+	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -393,42 +390,42 @@ func TestApiserverMetricsNamespaces(t *testing.T) {
 			executor: func() {
 				callOrDie(c.Create(context.TODO(), makeNamespace("foo"), metav1.CreateOptions{}))
 			},
-			want: `apiserver_request_total{code="201", component="apiserver", contentType="application/json", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="POST", version="v1"}`,
+			want: `apiserver_request_total{code="201", component="apiserver", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="POST", version="v1"}`,
 		},
 		{
 			name: "update namespace",
 			executor: func() {
 				callOrDie(c.Update(context.TODO(), makeNamespace("bar"), metav1.UpdateOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="PUT", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="PUT", version="v1"}`,
 		},
 		{
 			name: "update namespace status",
 			executor: func() {
 				callOrDie(c.UpdateStatus(context.TODO(), makeNamespace("bar"), metav1.UpdateOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="namespaces", scope="resource", subresource="status", verb="PUT", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="namespaces", scope="resource", subresource="status", verb="PUT", version="v1"}`,
 		},
 		{
 			name: "get namespace",
 			executor: func() {
 				callOrDie(c.Get(context.TODO(), "foo", metav1.GetOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="GET", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="GET", version="v1"}`,
 		},
 		{
 			name: "list namespace",
 			executor: func() {
 				callOrDie(c.List(context.TODO(), metav1.ListOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="namespaces", scope="cluster", subresource="", verb="LIST", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="namespaces", scope="cluster", subresource="", verb="LIST", version="v1"}`,
 		},
 		{
 			name: "delete namespace",
 			executor: func() {
 				callOrDie(nil, c.Delete(context.TODO(), "foo", metav1.DeleteOptions{}))
 			},
-			want: `apiserver_request_total{code="200", component="apiserver", contentType="application/json", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="DELETE", version="v1"}`,
+			want: `apiserver_request_total{code="200", component="apiserver", dry_run="", group="", resource="namespaces", scope="resource", subresource="", verb="DELETE", version="v1"}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -462,7 +459,7 @@ func TestApiserverMetricsNamespaces(t *testing.T) {
 	}
 }
 
-func getSamples(s *httptest.Server) (model.Samples, error) {
+func getSamples(s *kubeapiservertesting.TestServer) (model.Samples, error) {
 	metrics, err := scrapeMetrics(s)
 	if err != nil {
 		return nil, err

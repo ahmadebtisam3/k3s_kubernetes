@@ -28,7 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
@@ -37,44 +36,31 @@ import (
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/etcd"
 	"k8s.io/kubernetes/test/integration/framework"
-	"sigs.k8s.io/yaml"
 )
 
 // namespace used for all tests, do not change this
 const testNamespace = "statusnamespace"
 
 var statusData = map[schema.GroupVersionResource]string{
-	gvr("", "v1", "persistentvolumes"):                                  `{"status": {"message": "hello"}}`,
-	gvr("", "v1", "resourcequotas"):                                     `{"status": {"used": {"cpu": "5M"}}}`,
-	gvr("", "v1", "services"):                                           `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
-	gvr("extensions", "v1beta1", "ingresses"):                           `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
-	gvr("networking.k8s.io", "v1beta1", "ingresses"):                    `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
-	gvr("networking.k8s.io", "v1", "ingresses"):                         `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
-	gvr("autoscaling", "v1", "horizontalpodautoscalers"):                `{"status": {"currentReplicas": 5}}`,
-	gvr("batch", "v1beta1", "cronjobs"):                                 `{"status": {"lastScheduleTime": null}}`,
-	gvr("batch", "v2alpha1", "cronjobs"):                                `{"status": {"lastScheduleTime": null}}`,
-	gvr("storage.k8s.io", "v1", "volumeattachments"):                    `{"status": {"attached": true}}`,
-	gvr("policy", "v1beta1", "poddisruptionbudgets"):                    `{"status": {"currentHealthy": 5}}`,
-	gvr("certificates.k8s.io", "v1beta1", "certificatesigningrequests"): `{"status": {"conditions": [{"type": "MyStatus"}]}}`,
-	gvr("certificates.k8s.io", "v1", "certificatesigningrequests"):      `{"status": {"conditions": [{"type": "MyStatus", "status": "True"}]}}`,
-	gvr("internal.apiserver.k8s.io", "v1alpha1", "storageversions"):     `{"status": {"commonEncodingVersion":"v1","storageVersions":[{"apiServerID":"1","decodableVersions":["v1","v2"],"encodingVersion":"v1"}],"conditions":[{"type":"AllEncodingVersionsEqual","status":"True","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"allEncodingVersionsEqual","message":"all encoding versions are set to v1"}]}}`,
+	gvr("", "v1", "persistentvolumes"):                              `{"status": {"message": "hello"}}`,
+	gvr("", "v1", "resourcequotas"):                                 `{"status": {"used": {"cpu": "5M"}}}`,
+	gvr("", "v1", "services"):                                       `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
+	gvr("extensions", "v1beta1", "ingresses"):                       `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
+	gvr("networking.k8s.io", "v1beta1", "ingresses"):                `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
+	gvr("networking.k8s.io", "v1", "ingresses"):                     `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
+	gvr("extensions", "v1beta1", "networkpolicies"):                 `{"status": {"conditions":[{"type":"Accepted","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"RuleApplied","message":"Rule was applied"}]}}`,
+	gvr("networking.k8s.io", "v1", "networkpolicies"):               `{"status": {"conditions":[{"type":"Accepted","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"RuleApplied","message":"Rule was applied"}]}}`,
+	gvr("autoscaling", "v1", "horizontalpodautoscalers"):            `{"status": {"currentReplicas": 5}}`,
+	gvr("autoscaling", "v2", "horizontalpodautoscalers"):            `{"status": {"currentReplicas": 5}}`,
+	gvr("batch", "v1", "cronjobs"):                                  `{"status": {"lastScheduleTime": null}}`,
+	gvr("batch", "v1beta1", "cronjobs"):                             `{"status": {"lastScheduleTime": null}}`,
+	gvr("storage.k8s.io", "v1", "volumeattachments"):                `{"status": {"attached": true}}`,
+	gvr("policy", "v1", "poddisruptionbudgets"):                     `{"status": {"currentHealthy": 5}}`,
+	gvr("policy", "v1beta1", "poddisruptionbudgets"):                `{"status": {"currentHealthy": 5}}`,
+	gvr("internal.apiserver.k8s.io", "v1alpha1", "storageversions"): `{"status": {"commonEncodingVersion":"v1","storageVersions":[{"apiServerID":"1","decodableVersions":["v1","v2"],"encodingVersion":"v1"}],"conditions":[{"type":"AllEncodingVersionsEqual","status":"True","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"allEncodingVersionsEqual","message":"all encoding versions are set to v1"}]}}`,
 }
 
-const statusDefault = `{"status": {"conditions": [{"type": "MyStatus", "status":"true"}]}}`
-
-// DO NOT ADD TO THIS LIST.
-// This list is used to ignore known bugs. We shouldn't introduce new bugs.
-var ignoreList = map[schema.GroupVersionResource]struct{}{
-	// TODO(#89264): apiservices doesn't work because the openapi is not routed properly.
-	gvr("apiregistration.k8s.io", "v1beta1", "apiservices"): {},
-	gvr("apiregistration.k8s.io", "v1", "apiservices"):      {},
-}
-
-// Some status-only APIs have empty object on creation. Therefore we don't expect create_test
-// managedFields for these APIs
-var ignoreCreateManagementList = map[schema.GroupVersionResource]struct{}{
-	gvr("internal.apiserver.k8s.io", "v1alpha1", "storageversions"): {},
-}
+const statusDefault = `{"status": {"conditions": [{"type": "MyStatus", "status":"True"}]}}`
 
 func gvr(g, v, r string) schema.GroupVersionResource {
 	return schema.GroupVersionResource{Group: g, Version: v, Resource: r}
@@ -146,9 +132,12 @@ func TestApplyStatus(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Run(mapping.Resource.String(), func(t *testing.T) {
-				if _, ok := ignoreList[mapping.Resource]; ok {
+				// both spec and status get wiped for CSRs,
+				// nothing is expected to be managed for it, skip it
+				if mapping.Resource.Resource == "certificatesigningrequests" {
 					t.Skip()
 				}
+
 				status, ok := statusData[mapping.Resource]
 				if !ok {
 					status = statusDefault
@@ -167,8 +156,13 @@ func TestApplyStatus(t *testing.T) {
 					namespace = ""
 				}
 				name := newObj.GetName()
+
+				// etcd test stub data doesn't contain apiVersion/kind (!), but apply requires it
+				newObj.SetGroupVersionKind(mapping.GroupVersionKind)
+
 				rsc := dynamicClient.Resource(mapping.Resource).Namespace(namespace)
-				_, err := rsc.Create(context.TODO(), &newObj, metav1.CreateOptions{FieldManager: "create_test"})
+				// apply to create
+				_, err = rsc.Apply(context.TODO(), name, &newObj, metav1.ApplyOptions{FieldManager: "create_test"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -180,16 +174,11 @@ func TestApplyStatus(t *testing.T) {
 				statusObj.SetAPIVersion(mapping.GroupVersionKind.GroupVersion().String())
 				statusObj.SetKind(mapping.GroupVersionKind.Kind)
 				statusObj.SetName(name)
-				statusYAML, err := yaml.Marshal(statusObj.Object)
-				if err != nil {
-					t.Fatal(err)
-				}
 
-				True := true
 				obj, err := dynamicClient.
 					Resource(mapping.Resource).
 					Namespace(namespace).
-					Patch(context.TODO(), name, types.ApplyPatchType, statusYAML, metav1.PatchOptions{FieldManager: "apply_status_test", Force: &True}, "status")
+					ApplyStatus(context.TODO(), name, &statusObj, metav1.ApplyOptions{FieldManager: "apply_status_test", Force: true})
 				if err != nil {
 					t.Fatalf("Failed to apply: %v", err)
 				}
@@ -207,11 +196,7 @@ func TestApplyStatus(t *testing.T) {
 					t.Fatalf("Couldn't find apply_status_test: %v", managedFields)
 				}
 				if !findManager(managedFields, "create_test") {
-					if _, ok := ignoreCreateManagementList[mapping.Resource]; !ok {
-						t.Fatalf("Couldn't find create_test: %v", managedFields)
-					}
-				} else if _, ok := ignoreCreateManagementList[mapping.Resource]; ok {
-					t.Fatalf("found create_test in ignoreCreateManagementList resource: %v", managedFields)
+					t.Fatalf("Couldn't find create_test: %v", managedFields)
 				}
 
 				if err := rsc.Delete(context.TODO(), name, *metav1.NewDeleteOptions(0)); err != nil {

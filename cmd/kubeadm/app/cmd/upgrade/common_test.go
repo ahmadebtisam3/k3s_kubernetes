@@ -18,9 +18,12 @@ package upgrade
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/output"
 )
 
 func TestEnforceRequirements(t *testing.T) {
@@ -52,7 +55,7 @@ func TestEnforceRequirements(t *testing.T) {
 	}
 	for _, tt := range tcases {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, _, err := enforceRequirements(&tt.flags, nil, tt.dryRun, false)
+			_, _, _, err := enforceRequirements(&tt.flags, nil, tt.dryRun, false, &output.TextPrinter{})
 
 			if err == nil && tt.expectedErr {
 				t.Error("Expected error, but got success")
@@ -85,16 +88,12 @@ func TestPrintConfiguration(t *testing.T) {
 						DataDir: "/some/path",
 					},
 				},
-				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
-				},
 			},
-			expectedBytes: []byte(`[upgrade/config] Configuration used:
+			expectedBytes: []byte(fmt.Sprintf(`[upgrade/config] Configuration used:
 	apiServer: {}
-	apiVersion: kubeadm.k8s.io/v1beta2
+	apiVersion: %s
 	controllerManager: {}
-	dns:
-	  type: CoreDNS
+	dns: {}
 	etcd:
 	  local:
 	    dataDir: /some/path
@@ -102,7 +101,7 @@ func TestPrintConfiguration(t *testing.T) {
 	kubernetesVersion: v1.7.1
 	networking: {}
 	scheduler: {}
-`),
+`, kubeadmapiv1.SchemeGroupVersion.String())),
 		},
 		{
 			name: "cluster config with ServiceSubnet and external Etcd",
@@ -116,16 +115,12 @@ func TestPrintConfiguration(t *testing.T) {
 						Endpoints: []string{"https://one-etcd-instance:2379"},
 					},
 				},
-				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
-				},
 			},
 			expectedBytes: []byte(`[upgrade/config] Configuration used:
 	apiServer: {}
-	apiVersion: kubeadm.k8s.io/v1beta2
+	apiVersion: ` + kubeadmapiv1.SchemeGroupVersion.String() + `
 	controllerManager: {}
-	dns:
-	  type: CoreDNS
+	dns: {}
 	etcd:
 	  external:
 	    caFile: ""
@@ -144,7 +139,7 @@ func TestPrintConfiguration(t *testing.T) {
 	for _, rt := range tests {
 		t.Run(rt.name, func(t *testing.T) {
 			rt.buf = bytes.NewBufferString("")
-			printConfiguration(rt.cfg, rt.buf)
+			printConfiguration(rt.cfg, rt.buf, &output.TextPrinter{})
 			actualBytes := rt.buf.Bytes()
 			if !bytes.Equal(actualBytes, rt.expectedBytes) {
 				t.Errorf(

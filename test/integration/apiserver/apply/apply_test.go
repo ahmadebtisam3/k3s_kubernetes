@@ -22,12 +22,12 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"sigs.k8s.io/yaml"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -35,37 +35,32 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/controlplane"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-func setup(t testing.TB, groupVersions ...schema.GroupVersion) (*httptest.Server, clientset.Interface, framework.CloseFunc) {
-	opts := framework.MasterConfigOptions{EtcdOptions: framework.DefaultEtcdOptions()}
-	opts.EtcdOptions.DefaultStorageMediaType = "application/vnd.kubernetes.protobuf"
-	masterConfig := framework.NewIntegrationTestMasterConfigWithOptions(&opts)
-	if len(groupVersions) > 0 {
-		resourceConfig := controlplane.DefaultAPIResourceConfigSource()
-		resourceConfig.EnableVersions(groupVersions...)
-		masterConfig.ExtraConfig.APIResourceConfigSource = resourceConfig
-	}
-	masterConfig.GenericConfig.OpenAPIConfig = framework.DefaultOpenAPIConfig()
-	_, s, closeFn := framework.RunAMaster(masterConfig)
+func setup(t testing.TB) (clientset.Interface, kubeapiservertesting.TearDownFunc) {
+	// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, framework.SharedEtcd())
 
-	clientSet, err := clientset.NewForConfig(&restclient.Config{Host: s.URL, QPS: -1})
+	config := restclient.CopyConfig(server.ClientConfig)
+	// There are some tests (in scale_test.go) that rely on the response to be returned in JSON.
+	// So we overwrite it here.
+	config.ContentType = runtime.ContentTypeJSON
+	clientSet, err := clientset.NewForConfig(config)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
-	return s, clientSet, closeFn
+	return clientSet, server.TearDownFn
 }
 
 // TestApplyAlsoCreates makes sure that PATCH requests with the apply content type
@@ -74,7 +69,7 @@ func setup(t testing.TB, groupVersions ...schema.GroupVersion) (*httptest.Server
 func TestApplyAlsoCreates(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	testCases := []struct {
@@ -118,35 +113,37 @@ func TestApplyAlsoCreates(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
-			Namespace("default").
-			Resource(tc.resource).
-			Name(tc.name).
-			Param("fieldManager", "apply_test").
-			Body([]byte(tc.body)).
-			Do(context.TODO()).
-			Get()
-		if err != nil {
-			t.Fatalf("Failed to create object using Apply patch: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+				Namespace("default").
+				Resource(tc.resource).
+				Name(tc.name).
+				Param("fieldManager", "apply_test").
+				Body([]byte(tc.body)).
+				Do(context.TODO()).
+				Get()
+			if err != nil {
+				t.Fatalf("Failed to create object using Apply patch: %v", err)
+			}
 
-		_, err = client.CoreV1().RESTClient().Get().Namespace("default").Resource(tc.resource).Name(tc.name).Do(context.TODO()).Get()
-		if err != nil {
-			t.Fatalf("Failed to retrieve object: %v", err)
-		}
+			_, err = client.CoreV1().RESTClient().Get().Namespace("default").Resource(tc.resource).Name(tc.name).Do(context.TODO()).Get()
+			if err != nil {
+				t.Fatalf("Failed to retrieve object: %v", err)
+			}
 
-		// Test that we can re apply with a different field manager and don't get conflicts
-		_, err = client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
-			Namespace("default").
-			Resource(tc.resource).
-			Name(tc.name).
-			Param("fieldManager", "apply_test_2").
-			Body([]byte(tc.body)).
-			Do(context.TODO()).
-			Get()
-		if err != nil {
-			t.Fatalf("Failed to re-apply object using Apply patch: %v", err)
-		}
+			// Test that we can re apply with a different field manager and don't get conflicts
+			_, err = client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+				Namespace("default").
+				Resource(tc.resource).
+				Name(tc.name).
+				Param("fieldManager", "apply_test_2").
+				Body([]byte(tc.body)).
+				Do(context.TODO()).
+				Get()
+			if err != nil {
+				t.Fatalf("Failed to re-apply object using Apply patch: %v", err)
+			}
+		})
 	}
 }
 
@@ -155,7 +152,7 @@ func TestApplyAlsoCreates(t *testing.T) {
 func TestNoOpUpdateSameResourceVersion(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	podName := "no-op"
@@ -252,12 +249,191 @@ func TestNoOpUpdateSameResourceVersion(t *testing.T) {
 	}
 }
 
+func getRV(obj runtime.Object) (string, error) {
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		return "", err
+	}
+	return acc.GetResourceVersion(), nil
+}
+
+// TestNoSemanticUpdateAppleSameResourceVersion makes sure that APPLY requests which makes no semantic changes
+// will not change the resource version (no write to etcd is done)
+//
+// Some of the non-semantic changes are:
+// - Applying an atomic struct that removes a default
+// - Changing Quantity or other fields that are normalized
+func TestNoSemanticUpdateApplySameResourceVersion(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	ssBytes := []byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "StatefulSet",
+		"metadata": {
+			"name": "nginx",
+			"labels": {"app": "nginx"}
+		},
+		"spec": {
+			"serviceName": "nginx",
+			"selector": { "matchLabels": {"app": "nginx"}},
+			"template": {
+				"metadata": {
+					"labels": {"app": "nginx"}
+				},
+				"spec": {
+					"containers": [{
+						"name":  "nginx",
+						"image": "nginx",
+						"resources": {
+							"limits": {"memory": "2048Mi"}
+						}
+					}]
+				}
+			},
+			"volumeClaimTemplates": [{
+				"metadata": {"name": "nginx"},
+				"spec": {
+					"accessModes": ["ReadWriteOnce"],
+					"resources": {"requests": {"storage": "1Gi"}}
+				}
+			}]
+		}
+	}`)
+
+	obj, err := client.AppsV1().RESTClient().Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "apply_test").
+		Resource("statefulsets").
+		Name("nginx").
+		Body(ssBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+
+	rvCreated, err := getRV(obj)
+	if err != nil {
+		t.Fatalf("Failed to get RV: %v", err)
+	}
+
+	// Sleep for one second to make sure that the times of each update operation is different.
+	time.Sleep(1200 * time.Millisecond)
+
+	obj, err = client.AppsV1().RESTClient().Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "apply_test").
+		Resource("statefulsets").
+		Name("nginx").
+		Body(ssBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+	rvApplied, err := getRV(obj)
+	if err != nil {
+		t.Fatalf("Failed to get RV: %v", err)
+	}
+	if rvApplied != rvCreated {
+		t.Fatal("ResourceVersion changed after apply")
+	}
+}
+
+// TestNoSemanticUpdateAppleSameResourceVersion makes sure that PUT requests which makes no semantic changes
+// will not change the resource version (no write to etcd is done)
+//
+// Some of the non-semantic changes are:
+// - Applying an atomic struct that removes a default
+// - Changing Quantity or other fields that are normalized
+func TestNoSemanticUpdatePutSameResourceVersion(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	ssBytes := []byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "StatefulSet",
+		"metadata": {
+			"name": "nginx",
+			"labels": {"app": "nginx"}
+		},
+		"spec": {
+			"serviceName": "nginx",
+			"selector": { "matchLabels": {"app": "nginx"}},
+			"template": {
+				"metadata": {
+					"labels": {"app": "nginx"}
+				},
+				"spec": {
+					"containers": [{
+						"name":  "nginx",
+						"image": "nginx",
+						"resources": {
+							"limits": {"memory": "2048Mi"}
+						}
+					}]
+				}
+			},
+			"volumeClaimTemplates": [{
+				"metadata": {"name": "nginx"},
+				"spec": {
+					"accessModes": ["ReadWriteOnce"],
+					"resources": { "requests": { "storage": "1Gi"}}
+				}
+			}]
+		}
+	}`)
+
+	obj, err := client.AppsV1().RESTClient().Post().
+		Namespace("default").
+		Param("fieldManager", "apply_test").
+		Resource("statefulsets").
+		Body(ssBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+
+	rvCreated, err := getRV(obj)
+	if err != nil {
+		t.Fatalf("Failed to get RV: %v", err)
+	}
+
+	// Sleep for one second to make sure that the times of each update operation is different.
+	time.Sleep(1200 * time.Millisecond)
+
+	obj, err = client.AppsV1().RESTClient().Put().
+		Namespace("default").
+		Param("fieldManager", "apply_test").
+		Resource("statefulsets").
+		Name("nginx").
+		Body(ssBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+	rvApplied, err := getRV(obj)
+	if err != nil {
+		t.Fatalf("Failed to get RV: %v", err)
+	}
+	if rvApplied != rvCreated {
+		t.Fatal("ResourceVersion changed after similar PUT")
+	}
+}
+
 // TestCreateOnApplyFailsWithUID makes sure that PATCH requests with the apply content type
 // will not create the object if it doesn't already exist and it specifies a UID
 func TestCreateOnApplyFailsWithUID(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -289,7 +465,7 @@ func TestCreateOnApplyFailsWithUID(t *testing.T) {
 func TestApplyUpdateApplyConflictForced(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -379,7 +555,7 @@ func TestApplyUpdateApplyConflictForced(t *testing.T) {
 func TestApplyGroupsManySeparateUpdates(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -403,12 +579,8 @@ func TestApplyGroupsManySeparateUpdates(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		unique := fmt.Sprintf("updater%v", i)
-		version := "v1"
-		if i%2 == 0 {
-			version = "v1beta1"
-		}
 		object, err = client.CoreV1().RESTClient().Patch(types.MergePatchType).
-			AbsPath("/apis/admissionregistration.k8s.io/"+version).
+			AbsPath("/apis/admissionregistration.k8s.io/v1").
 			Resource("validatingwebhookconfigurations").
 			Name("webhook").
 			Param("fieldManager", unique).
@@ -447,7 +619,7 @@ func TestApplyGroupsManySeparateUpdates(t *testing.T) {
 func TestCreateVeryLargeObject(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	cfg := &v1.ConfigMap{
@@ -493,7 +665,7 @@ func TestCreateVeryLargeObject(t *testing.T) {
 func TestUpdateVeryLargeObject(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	cfg := &v1.ConfigMap{
@@ -559,7 +731,7 @@ func TestUpdateVeryLargeObject(t *testing.T) {
 func TestPatchVeryLargeObject(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	cfg := &v1.ConfigMap{
@@ -618,7 +790,7 @@ func TestPatchVeryLargeObject(t *testing.T) {
 func TestApplyManagedFields(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -686,16 +858,10 @@ func TestApplyManagedFields(t *testing.T) {
 		t.Fatalf("Failed to marshal object: %v", err)
 	}
 
-	selfLink := ""
-	if !utilfeature.DefaultFeatureGate.Enabled(genericfeatures.RemoveSelfLink) {
-		selfLink = `
-			"selfLink": "` + accessor.GetSelfLink() + `",`
-	}
-
 	expected := []byte(`{
 		"metadata": {
 			"name": "test-cm",
-			"namespace": "default",` + selfLink + `
+			"namespace": "default",
 			"uid": "` + string(accessor.GetUID()) + `",
 			"resourceVersion": "` + accessor.GetResourceVersion() + `",
 			"creationTimestamp": "` + accessor.GetCreationTimestamp().UTC().Format(time.RFC3339) + `",
@@ -751,7 +917,7 @@ func TestApplyManagedFields(t *testing.T) {
 func TestApplyRemovesEmptyManagedFields(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -803,7 +969,7 @@ func TestApplyRemovesEmptyManagedFields(t *testing.T) {
 func TestApplyRequiresFieldManager(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -843,7 +1009,7 @@ func TestApplyRequiresFieldManager(t *testing.T) {
 func TestApplyRemoveContainerPort(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -947,7 +1113,7 @@ func TestApplyRemoveContainerPort(t *testing.T) {
 func TestApplyFailsWithVersionMismatch(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -1044,7 +1210,7 @@ func TestApplyFailsWithVersionMismatch(t *testing.T) {
 func TestApplyConvertsManagedFieldsVersion(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`{
@@ -1187,7 +1353,7 @@ func TestApplyConvertsManagedFieldsVersion(t *testing.T) {
 func TestClearManagedFieldsWithMergePatch(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -1243,7 +1409,7 @@ func TestClearManagedFieldsWithMergePatch(t *testing.T) {
 func TestClearManagedFieldsWithStrategicMergePatch(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -1303,7 +1469,7 @@ func TestClearManagedFieldsWithStrategicMergePatch(t *testing.T) {
 func TestClearManagedFieldsWithJSONPatch(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -1359,7 +1525,7 @@ func TestClearManagedFieldsWithJSONPatch(t *testing.T) {
 func TestClearManagedFieldsWithUpdate(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -1433,7 +1599,7 @@ func TestClearManagedFieldsWithUpdate(t *testing.T) {
 func TestErrorsDontFail(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	// Tries to create with a managed fields that has an empty `fieldsType`.
@@ -1473,7 +1639,7 @@ func TestErrorsDontFail(t *testing.T) {
 func TestErrorsDontFailUpdate(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Post().
@@ -1537,7 +1703,7 @@ func TestErrorsDontFailUpdate(t *testing.T) {
 func TestErrorsDontFailPatch(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Post().
@@ -1587,7 +1753,7 @@ func TestErrorsDontFailPatch(t *testing.T) {
 func TestApplyDoesNotChangeManagedFieldsViaSubresources(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	podBytes := []byte(`{
@@ -1690,7 +1856,7 @@ func TestApplyDoesNotChangeManagedFieldsViaSubresources(t *testing.T) {
 func TestClearManagedFieldsWithUpdateEmptyList(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
@@ -1775,7 +1941,7 @@ func TestClearManagedFieldsWithUpdateEmptyList(t *testing.T) {
 func TestApplyUnsetExclusivelyOwnedFields(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	// spec.replicas is a optional, defaulted field
@@ -1884,7 +2050,7 @@ func TestApplyUnsetExclusivelyOwnedFields(t *testing.T) {
 func TestApplyUnsetSharedFields(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	// spec.replicas is a optional, defaulted field
@@ -1996,7 +2162,7 @@ func TestApplyUnsetSharedFields(t *testing.T) {
 func TestApplyCanTransferFieldOwnershipToController(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	// Applier creates a deployment with replicas set to 3
@@ -2115,7 +2281,7 @@ func TestApplyCanTransferFieldOwnershipToController(t *testing.T) {
 func TestApplyCanRemoveMapItemsContributedToByControllers(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	// Applier creates a deployment with a name=nginx container
@@ -2235,7 +2401,7 @@ func TestApplyCanRemoveMapItemsContributedToByControllers(t *testing.T) {
 func TestDefaultMissingKeys(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	// Applier creates a deployment with containerPort but no protocol
@@ -2484,7 +2650,7 @@ func encodePod(pod v1.Pod) []byte {
 func BenchmarkNoServerSideApply(b *testing.B) {
 	defer featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, false)()
 
-	_, client, closeFn := setup(b)
+	client, closeFn := setup(b)
 	defer closeFn()
 	flag.Lookup("v").Value.Set("0")
 
@@ -2497,7 +2663,8 @@ func getPodSizeWhenEnabled(b *testing.B, pod v1.Pod) int {
 
 func getPodBytesWhenEnabled(b *testing.B, pod v1.Pod, format string) []byte {
 	defer featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
-	_, client, closeFn := setup(b)
+
+	client, closeFn := setup(b)
 	defer closeFn()
 	flag.Lookup("v").Value.Set("0")
 
@@ -2521,7 +2688,7 @@ func BenchmarkNoServerSideApplyButSameSize(b *testing.B) {
 	ssaPodSize := getPodSizeWhenEnabled(b, pod)
 
 	defer featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, false)()
-	_, client, closeFn := setup(b)
+	client, closeFn := setup(b)
 	defer closeFn()
 	flag.Lookup("v").Value.Set("0")
 
@@ -2557,19 +2724,18 @@ func BenchmarkServerSideApply(b *testing.B) {
 
 	defer featuregatetesting.SetFeatureGateDuringTest(b, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(b)
+	client, closeFn := setup(b)
 	defer closeFn()
 	flag.Lookup("v").Value.Set("0")
 
 	benchAll(b, client, decodePod(podBytesWhenEnabled))
 }
 
-func benchAll(b *testing.B, client kubernetes.Interface, pod v1.Pod) {
+func benchAll(b *testing.B, client clientset.Interface, pod v1.Pod) {
 	// Make sure pod is ready to post
 	pod.ObjectMeta.CreationTimestamp = metav1.Time{}
 	pod.ObjectMeta.ResourceVersion = ""
 	pod.ObjectMeta.UID = ""
-	pod.ObjectMeta.SelfLink = ""
 
 	// Create pod for repeated-updates
 	pod.Name = "repeated-pod"
@@ -2593,7 +2759,7 @@ func benchAll(b *testing.B, client kubernetes.Interface, pod v1.Pod) {
 	b.Run("Post50", benchPostPod(client, pod, 50))
 }
 
-func benchPostPod(client kubernetes.Interface, pod v1.Pod, parallel int) func(*testing.B) {
+func benchPostPod(client clientset.Interface, pod v1.Pod, parallel int) func(*testing.B) {
 	return func(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
@@ -2623,7 +2789,7 @@ func benchPostPod(client kubernetes.Interface, pod v1.Pod, parallel int) func(*t
 	}
 }
 
-func createNamespace(client kubernetes.Interface, name string) error {
+func createNamespace(client clientset.Interface, name string) error {
 	namespace := v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	namespaceBytes, err := yaml.Marshal(namespace)
 	if err != nil {
@@ -2639,7 +2805,7 @@ func createNamespace(client kubernetes.Interface, name string) error {
 	return nil
 }
 
-func benchListPod(client kubernetes.Interface, pod v1.Pod, num int) func(*testing.B) {
+func benchListPod(client clientset.Interface, pod v1.Pod, num int) func(*testing.B) {
 	return func(b *testing.B) {
 		namespace := fmt.Sprintf("get-%d-%d", num, b.N)
 		if err := createNamespace(client, namespace); err != nil {
@@ -2674,7 +2840,7 @@ func benchListPod(client kubernetes.Interface, pod v1.Pod, num int) func(*testin
 	}
 }
 
-func benchRepeatedUpdate(client kubernetes.Interface, podName string) func(*testing.B) {
+func benchRepeatedUpdate(client clientset.Interface, podName string) func(*testing.B) {
 	return func(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
@@ -2694,7 +2860,7 @@ func benchRepeatedUpdate(client kubernetes.Interface, podName string) func(*test
 func TestUpgradeClientSideToServerSideApply(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
 
-	_, client, closeFn := setup(t)
+	client, closeFn := setup(t)
 	defer closeFn()
 
 	obj := []byte(`
@@ -2822,15 +2988,13 @@ spec:
 }
 
 func TestStopTrackingManagedFieldsOnFeatureDisabled(t *testing.T) {
-	sharedEtcd := framework.DefaultEtcdOptions()
-	masterConfig := framework.NewIntegrationTestMasterConfigWithOptions(&framework.MasterConfigOptions{
-		EtcdOptions: sharedEtcd,
-	})
-	masterConfig.GenericConfig.OpenAPIConfig = framework.DefaultOpenAPIConfig()
+	sharedEtcd := framework.SharedEtcd()
 
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
-	_, master, closeFn := framework.RunAMaster(masterConfig)
-	client, err := clientset.NewForConfig(&restclient.Config{Host: master.URL, QPS: -1})
+
+	// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, sharedEtcd)
+	client, err := clientset.NewForConfig(server.ClientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -2880,14 +3044,15 @@ spec:
 	}
 
 	// Restart server with server-side apply disabled
-	closeFn()
+	server.TearDownFn()
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, false)()
-	_, master, closeFn = framework.RunAMaster(masterConfig)
-	client, err = clientset.NewForConfig(&restclient.Config{Host: master.URL, QPS: -1})
+
+	server = kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins=ServiceAccount"}, sharedEtcd)
+	defer server.TearDownFn()
+	client, err = clientset.NewForConfig(server.ClientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
-	defer closeFn()
 
 	_, err = client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
 		AbsPath("/apis/apps/v1").
@@ -2918,5 +3083,772 @@ spec:
 	}
 	if managed := deploymentObj.GetManagedFields(); managed != nil {
 		t.Errorf("object has unexpected managedFields: %v", managed)
+	}
+}
+
+func TestRenamingAppliedFieldManagers(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	// Creating an object
+	podBytes := []byte(`{
+		"apiVersion": "v1",
+		"kind": "Pod",
+		"metadata": {
+			"name": "just-a-pod",
+			"labels": {
+				"a": "one"
+			}
+		},
+		"spec": {
+			"containers": [{
+				"name":  "test-container-a",
+				"image": "test-image-one"
+			}]
+		}
+	}`)
+	_, err := client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "multi_manager_one").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(podBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to apply: %v", err)
+	}
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "multi_manager_two").
+		Resource("pods").
+		Name("just-a-pod").
+		Body([]byte(`{"apiVersion":"v1","kind":"Pod","metadata":{"labels":{"b":"two"}}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to apply: %v", err)
+	}
+
+	pod, err := client.CoreV1().Pods("default").Get(context.TODO(), "just-a-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	expectedLabels := map[string]string{
+		"a": "one",
+		"b": "two",
+	}
+	if !reflect.DeepEqual(pod.Labels, expectedLabels) {
+		t.Fatalf("Expected labels to be %v, but got %v", expectedLabels, pod.Labels)
+	}
+
+	managedFields := pod.GetManagedFields()
+	for i := range managedFields {
+		managedFields[i].Manager = "multi_manager"
+	}
+	pod.SetManagedFields(managedFields)
+
+	obj, err := client.CoreV1().RESTClient().
+		Put().
+		Namespace("default").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(pod).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		t.Fatalf("Failed to get meta accessor for object: %v", err)
+	}
+	managedFields = accessor.GetManagedFields()
+	if len(managedFields) != 1 {
+		t.Fatalf("Expected object to have 1 managed fields entry, got: %d", len(managedFields))
+	}
+	entry := managedFields[0]
+	if entry.Manager != "multi_manager" || entry.Operation != "Apply" || string(entry.FieldsV1.Raw) != `{"f:metadata":{"f:labels":{"f:b":{}}}}` {
+		t.Fatalf(`Unexpected entry, got: %v`, entry)
+	}
+}
+
+func TestRenamingUpdatedFieldManagers(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	// Creating an object
+	podBytes := []byte(`{
+		"apiVersion": "v1",
+		"kind": "Pod",
+		"metadata": {
+			"name": "just-a-pod"
+		},
+		"spec": {
+			"containers": [{
+				"name":  "test-container-a",
+				"image": "test-image-one"
+			}]
+		}
+	}`)
+	_, err := client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "first").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(podBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.MergePatchType).
+		Namespace("default").
+		Param("fieldManager", "multi_manager_one").
+		Resource("pods").
+		Name("just-a-pod").
+		Body([]byte(`{"metadata":{"labels":{"a":"one"}}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.MergePatchType).
+		Namespace("default").
+		Param("fieldManager", "multi_manager_two").
+		Resource("pods").
+		Name("just-a-pod").
+		Body([]byte(`{"metadata":{"labels":{"b":"two"}}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+
+	pod, err := client.CoreV1().Pods("default").Get(context.TODO(), "just-a-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	expectedLabels := map[string]string{
+		"a": "one",
+		"b": "two",
+	}
+	if !reflect.DeepEqual(pod.Labels, expectedLabels) {
+		t.Fatalf("Expected labels to be %v, but got %v", expectedLabels, pod.Labels)
+	}
+
+	managedFields := pod.GetManagedFields()
+	for i := range managedFields {
+		managedFields[i].Manager = "multi_manager"
+	}
+	pod.SetManagedFields(managedFields)
+
+	obj, err := client.CoreV1().RESTClient().
+		Put().
+		Namespace("default").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(pod).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		t.Fatalf("Failed to get meta accessor for object: %v", err)
+	}
+	managedFields = accessor.GetManagedFields()
+	if len(managedFields) != 2 {
+		t.Fatalf("Expected object to have 2 managed fields entries, got: %d", len(managedFields))
+	}
+	entry := managedFields[1]
+	if entry.Manager != "multi_manager" || entry.Operation != "Update" || string(entry.FieldsV1.Raw) != `{"f:metadata":{"f:labels":{"f:b":{}}}}` {
+		t.Fatalf(`Unexpected entry, got: %v`, entry)
+	}
+}
+
+func TestDroppingSubresourceField(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	// Creating an object
+	podBytes := []byte(`{
+		"apiVersion": "v1",
+		"kind": "Pod",
+		"metadata": {
+			"name": "just-a-pod"
+		},
+		"spec": {
+			"containers": [{
+				"name":  "test-container-a",
+				"image": "test-image-one"
+			}]
+		}
+	}`)
+	_, err := client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "first").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(podBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "label_manager").
+		Resource("pods").
+		Name("just-a-pod").
+		Body([]byte(`{"apiVersion":"v1","kind":"Pod","metadata":{"labels":{"a":"one"}}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to apply: %v", err)
+	}
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "label_manager").
+		Resource("pods").
+		Name("just-a-pod").
+		SubResource("status").
+		Body([]byte(`{"apiVersion":"v1","kind":"Pod","metadata":{"labels":{"b":"two"}}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to apply: %v", err)
+	}
+
+	pod, err := client.CoreV1().Pods("default").Get(context.TODO(), "just-a-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	expectedLabels := map[string]string{
+		"a": "one",
+		"b": "two",
+	}
+	if !reflect.DeepEqual(pod.Labels, expectedLabels) {
+		t.Fatalf("Expected labels to be %v, but got %v", expectedLabels, pod.Labels)
+	}
+
+	managedFields := pod.GetManagedFields()
+	if len(managedFields) != 3 {
+		t.Fatalf("Expected object to have 3 managed fields entries, got: %d", len(managedFields))
+	}
+	if managedFields[1].Manager != "label_manager" || managedFields[1].Operation != "Apply" || managedFields[1].Subresource != "" {
+		t.Fatalf(`Unexpected entry, got: %v`, managedFields[1])
+	}
+	if managedFields[2].Manager != "label_manager" || managedFields[2].Operation != "Apply" || managedFields[2].Subresource != "status" {
+		t.Fatalf(`Unexpected entry, got: %v`, managedFields[2])
+	}
+
+	for i := range managedFields {
+		managedFields[i].Subresource = ""
+	}
+	pod.SetManagedFields(managedFields)
+
+	obj, err := client.CoreV1().RESTClient().
+		Put().
+		Namespace("default").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(pod).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		t.Fatalf("Failed to get meta accessor for object: %v", err)
+	}
+	managedFields = accessor.GetManagedFields()
+	if len(managedFields) != 2 {
+		t.Fatalf("Expected object to have 2 managed fields entries, got: %d", len(managedFields))
+	}
+	entry := managedFields[1]
+	if entry.Manager != "label_manager" || entry.Operation != "Apply" || string(entry.FieldsV1.Raw) != `{"f:metadata":{"f:labels":{"f:b":{}}}}` {
+		t.Fatalf(`Unexpected entry, got: %v`, entry)
+	}
+}
+
+func TestDroppingSubresourceFromSpecField(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	// Creating an object
+	podBytes := []byte(`{
+		"apiVersion": "v1",
+		"kind": "Pod",
+		"metadata": {
+			"name": "just-a-pod"
+		},
+		"spec": {
+			"containers": [{
+				"name":  "test-container-a",
+				"image": "test-image-one"
+			}]
+		}
+	}`)
+	_, err := client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Namespace("default").
+		Param("fieldManager", "first").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(podBytes).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to create object: %v", err)
+	}
+
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.MergePatchType).
+		Namespace("default").
+		Param("fieldManager", "manager").
+		Resource("pods").
+		Name("just-a-pod").
+		Body([]byte(`{"metadata":{"labels":{"a":"two"}}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.MergePatchType).
+		Namespace("default").
+		Param("fieldManager", "manager").
+		Resource("pods").
+		SubResource("status").
+		Name("just-a-pod").
+		Body([]byte(`{"status":{"phase":"Running"}}`)).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to apply: %v", err)
+	}
+
+	pod, err := client.CoreV1().Pods("default").Get(context.TODO(), "just-a-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+	expectedLabels := map[string]string{"a": "two"}
+	if !reflect.DeepEqual(pod.Labels, expectedLabels) {
+		t.Fatalf("Expected labels to be %v, but got %v", expectedLabels, pod.Labels)
+	}
+	if pod.Status.Phase != v1.PodRunning {
+		t.Fatalf("Expected phase to be %q, but got %q", v1.PodRunning, pod.Status.Phase)
+	}
+
+	managedFields := pod.GetManagedFields()
+	if len(managedFields) != 3 {
+		t.Fatalf("Expected object to have 3 managed fields entries, got: %d", len(managedFields))
+	}
+	if managedFields[1].Manager != "manager" || managedFields[1].Operation != "Update" || managedFields[1].Subresource != "" {
+		t.Fatalf(`Unexpected entry, got: %v`, managedFields[1])
+	}
+	if managedFields[2].Manager != "manager" || managedFields[2].Operation != "Update" || managedFields[2].Subresource != "status" {
+		t.Fatalf(`Unexpected entry, got: %v`, managedFields[2])
+	}
+
+	for i := range managedFields {
+		managedFields[i].Subresource = ""
+	}
+	pod.SetManagedFields(managedFields)
+
+	obj, err := client.CoreV1().RESTClient().
+		Put().
+		Namespace("default").
+		Resource("pods").
+		Name("just-a-pod").
+		Body(pod).
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update: %v", err)
+	}
+
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		t.Fatalf("Failed to get meta accessor for object: %v", err)
+	}
+	managedFields = accessor.GetManagedFields()
+	if len(managedFields) != 2 {
+		t.Fatalf("Expected object to have 2 managed fields entries, got: %d", len(managedFields))
+	}
+	entry := managedFields[1]
+	if entry.Manager != "manager" || entry.Operation != "Update" || string(entry.FieldsV1.Raw) != `{"f:status":{"f:phase":{}}}` {
+		t.Fatalf(`Unexpected entry, got: %v`, entry)
+	}
+}
+
+func TestSubresourceField(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	// Creating a deployment
+	deploymentBytes := []byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "Deployment",
+		"metadata": {
+			"name": "deployment",
+			"labels": {"app": "nginx"}
+		},
+		"spec": {
+			"replicas": 3,
+			"selector": {
+				"matchLabels": {
+					 "app": "nginx"
+				}
+			},
+			"template": {
+				"metadata": {
+					"labels": {
+						"app": "nginx"
+					}
+				},
+				"spec": {
+					"containers": [{
+						"name":  "nginx",
+						"image": "nginx:latest"
+					}]
+				}
+			}
+		}
+	}`)
+	_, err := client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		AbsPath("/apis/apps/v1").
+		Namespace("default").
+		Resource("deployments").
+		Name("deployment").
+		Param("fieldManager", "manager").
+		Body(deploymentBytes).Do(context.TODO()).Get()
+	if err != nil {
+		t.Fatalf("Failed to apply object: %v", err)
+	}
+
+	_, err = client.CoreV1().RESTClient().
+		Patch(types.MergePatchType).
+		AbsPath("/apis/apps/v1").
+		Namespace("default").
+		Resource("deployments").
+		SubResource("scale").
+		Name("deployment").
+		Body([]byte(`{"spec":{"replicas":32}}`)).
+		Param("fieldManager", "manager").
+		Do(context.TODO()).
+		Get()
+	if err != nil {
+		t.Fatalf("Failed to update status: %v", err)
+	}
+
+	deployment, err := client.AppsV1().Deployments("default").Get(context.TODO(), "deployment", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get object: %v", err)
+	}
+
+	managedFields := deployment.GetManagedFields()
+	if len(managedFields) != 2 {
+		t.Fatalf("Expected object to have 2 managed fields entries, got: %d", len(managedFields))
+	}
+	if managedFields[0].Manager != "manager" || managedFields[0].Operation != "Apply" || managedFields[0].Subresource != "" {
+		t.Fatalf(`Unexpected entry, got: %v`, managedFields[0])
+	}
+	if managedFields[1].Manager != "manager" ||
+		managedFields[1].Operation != "Update" ||
+		managedFields[1].Subresource != "scale" ||
+		string(managedFields[1].FieldsV1.Raw) != `{"f:spec":{"f:replicas":{}}}` {
+		t.Fatalf(`Unexpected entry, got: %v`, managedFields[1])
+	}
+}
+
+// K8s has a bug introduced in vX.XX.X which changed the treatment of
+// ObjectReferences from granular to atomic. This means that only one manager
+// may own all fields of the ObjectReference. This resulted in a regression
+// for the common use case of user-specified GVK, and machine-populated UID fields.
+//
+// This is a test to show that clusters  affected by this bug before it was fixed
+// do not experience any friction when updating to a version of k8s which marks
+// the fields' management again as granular.
+func TestApplyFormerlyAtomicFields(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	// Start server with our populated ObjectReference. Since it is atomic its
+	// ownership changed when XX popualted the UID after the user specified the
+	// GVKN.
+
+	// 1. Create PersistentVolume with its claimRef owned by
+	//		kube-controller-manager as in v1.22 - 1.24
+	// 2. Attempt to re-apply the original PersistentVolume which does not
+	//		include uid.
+	// 3. Check that:
+	//		a.) The operaiton was successfu;
+	//		b.) The uid is unchanged
+
+	client, closeFn := setup(t)
+	defer closeFn()
+
+	// old PersistentVolume from last version of k8s with its claimRef owned
+	// atomically
+	oldPersistentVolume := []byte(`
+	{
+		"apiVersion": "v1",
+		"kind": "PersistentVolume",
+		"metadata": {
+			"creationTimestamp": "2022-06-08T23:46:32Z",
+			"finalizers": [
+				"kubernetes.io/pv-protection"
+			],
+			"labels": {
+				"type": "local"
+			},
+			"name": "pv-storage",
+			"uid": "112b18f7-fde6-4e48-aa61-f5168bd576b8"
+		},
+		"spec": {
+			"accessModes": [
+				"ReadWriteOnce"
+			],
+			"capacity": {
+				"storage": "16Mi"
+			},
+			"claimRef": {
+				"apiVersion": "v1",
+				"kind": "PersistentVolumeClaim",
+				"name": "pvc-storage",
+				"namespace": "default",
+				"resourceVersion": "15499",
+				"uid": "2018e302-7b12-406c-9fa2-e52535d29e48"
+			},
+			"hostPath": {
+				"path": "“/tmp/mydata",
+				"type": ""
+			},
+			"persistentVolumeReclaimPolicy": "Retain",
+			"volumeMode": "Filesystem"
+		},
+		"status": {
+			"phase": "Bound"
+		}
+	}`)
+
+	managedFieldsUpdate := []byte(`{
+		"apiVersion": "v1",
+		"kind": "PersistentVolume",
+		"metadata": {
+			"name": "pv-storage",
+			"managedFields": [
+				{
+					"apiVersion": "v1",
+					"fieldsType": "FieldsV1",
+					"fieldsV1": {
+						"f:metadata": {
+							"f:labels": {
+								"f:type": {}
+							}
+						},
+						"f:spec": {
+							"f:accessModes": {},
+							"f:capacity": {
+								"f:storage": {}
+							},
+							"f:hostPath": {
+								"f:path": {}
+							},
+							"f:storageClassName": {}
+						}
+					},
+					"manager": "apply_test",
+					"operation": "Apply",
+					"time": "2022-06-08T23:46:32Z"
+				},
+				{
+					"apiVersion": "v1",
+					"fieldsType": "FieldsV1",
+					"fieldsV1": {
+						"f:status": {
+							"f:phase": {}
+						}
+					},
+					"manager": "kube-controller-manager",
+					"operation": "Update",
+					"subresource": "status",
+					"time": "2022-06-08T23:46:32Z"
+				},
+				{
+					"apiVersion": "v1",
+					"fieldsType": "FieldsV1",
+					"fieldsV1": {
+						"f:spec": {
+							"f:claimRef": {}
+						}
+					},
+					"manager": "kube-controller-manager",
+					"operation": "Update",
+					"time": "2022-06-08T23:46:37Z"
+				}
+			]
+		}
+	}`)
+
+	// Re-applies name and namespace
+	originalPV := []byte(`{
+		"kind": "PersistentVolume",
+		"apiVersion": "v1",
+		"metadata": {
+			"labels": {
+				"type": "local"
+			},
+			"name": "pv-storage",
+		},
+		"spec": {
+			"storageClassName": "",
+			"capacity": {
+				"storage": "16Mi"
+			},
+			"accessModes": [
+				"ReadWriteOnce"
+			],
+			"hostPath": {
+				"path": "“/tmp/mydata"
+			},
+			"claimRef": {
+				"name": "pvc-storage",
+				"namespace": "default"
+			}
+		}
+	}`)
+
+	// Create PV
+	originalObj, err := client.CoreV1().RESTClient().
+		Post().
+		Param("fieldManager", "apply_test").
+		Resource("persistentvolumes").
+		Body(oldPersistentVolume).
+		Do(context.TODO()).
+		Get()
+
+	if err != nil {
+		t.Fatalf("Failed to apply object: %v", err)
+	} else if _, ok := originalObj.(*v1.PersistentVolume); !ok {
+		t.Fatalf("returned object is incorrect type: %t", originalObj)
+	}
+
+	// Directly set managed fields to object
+	newObj, err := client.CoreV1().RESTClient().
+		Patch(types.StrategicMergePatchType).
+		Name("pv-storage").
+		Param("fieldManager", "apply_test").
+		Resource("persistentvolumes").
+		Body(managedFieldsUpdate).
+		Do(context.TODO()).
+		Get()
+
+	if err != nil {
+		t.Fatalf("Failed to apply object: %v", err)
+	} else if _, ok := newObj.(*v1.PersistentVolume); !ok {
+		t.Fatalf("returned object is incorrect type: %t", newObj)
+	}
+
+	// Is initialized, attempt to write to fields underneath
+	//	claimRef ObjectReference.
+	newObj, err = client.CoreV1().RESTClient().
+		Patch(types.ApplyPatchType).
+		Name("pv-storage").
+		Param("fieldManager", "apply_test").
+		Resource("persistentvolumes").
+		Body(originalPV).
+		Do(context.TODO()).
+		Get()
+
+	if err != nil {
+		t.Fatalf("Failed to apply object: %v", err)
+	} else if _, ok := newObj.(*v1.PersistentVolume); !ok {
+		t.Fatalf("returned object is incorrect type: %t", newObj)
+	}
+
+	// Test that bug is fixed by showing no error and that uid is not cleared.
+	if !reflect.DeepEqual(originalObj.(*v1.PersistentVolume).Spec.ClaimRef, newObj.(*v1.PersistentVolume).Spec.ClaimRef) {
+		t.Fatalf("claimRef changed unexpectedly")
+	}
+
+	// Expect that we know own name/namespace fields
+	// All other fields unowned
+	// Make sure apply_test now owns claimRef.UID and that kube-controller-manager owns
+	// claimRef (but its ownership is not respected due to new granular structType)
+	managedFields := newObj.(*v1.PersistentVolume).ManagedFields
+	var expectedManagedFields []metav1.ManagedFieldsEntry
+	expectedManagedFieldsString := []byte(`[
+		{
+			"apiVersion": "v1",
+			"fieldsType": "FieldsV1",
+			"fieldsV1": {"f:metadata":{"f:labels":{"f:type":{}}},"f:spec":{"f:accessModes":{},"f:capacity":{"f:storage":{}},"f:claimRef":{"f:name":{},"f:namespace":{}},"f:hostPath":{"f:path":{}},"f:storageClassName":{}}},
+			"manager": "apply_test",
+			"operation": "Apply",
+			"time": "2022-06-08T23:46:32Z"
+		},
+		{
+			"apiVersion": "v1",
+			"fieldsType": "FieldsV1",
+			"fieldsV1": {"f:status":{"f:phase":{}}},
+			"manager": "kube-controller-manager",
+			"operation": "Update",
+			"subresource": "status",
+			"time": "2022-06-08T23:46:32Z"
+		},
+		{
+			"apiVersion": "v1",
+			"fieldsType": "FieldsV1",
+			"fieldsV1": {"f:spec":{"f:claimRef":{}}},
+			"manager": "kube-controller-manager",
+			"operation": "Update",
+			"time": "2022-06-08T23:46:37Z"
+		}
+	]`)
+
+	err = json.Unmarshal(expectedManagedFieldsString, &expectedManagedFields)
+	if err != nil {
+		t.Fatalf("unexpectly failed to decode expected managed fields")
+	}
+
+	// Wipe timestamps before comparison
+	for i := range expectedManagedFields {
+		expectedManagedFields[i].Time = nil
+	}
+
+	for i := range managedFields {
+		managedFields[i].Time = nil
+	}
+
+	if !reflect.DeepEqual(expectedManagedFields, managedFields) {
+		t.Fatalf("unexpected managed fields: %v", cmp.Diff(expectedManagedFields, managedFields))
 	}
 }

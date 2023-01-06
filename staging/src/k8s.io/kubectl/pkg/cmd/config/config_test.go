@@ -864,7 +864,7 @@ func testConfigCommand(args []string, startingConfig clientcmdapi.Config, t *tes
 	argsToUse = append(argsToUse, args...)
 
 	streams, _, buf, _ := genericclioptions.NewTestIOStreams()
-	cmd := NewCmdConfig(cmdutil.NewFactory(genericclioptions.NewTestConfigFlags()), clientcmd.NewDefaultPathOptions(), streams)
+	cmd := NewCmdConfig(clientcmd.NewDefaultPathOptions(), streams)
 	// "context" is a global flag, inherited from base kubectl command in the real world
 	cmd.PersistentFlags().String("context", "", "The name of the kubeconfig context to use")
 	cmd.SetArgs(argsToUse)
@@ -921,7 +921,7 @@ func testClearLocationOfOrigin(config *clientcmdapi.Config) {
 }
 func testSetNilMapsToEmpties(curr reflect.Value) {
 	actualCurrValue := curr
-	if curr.Kind() == reflect.Ptr {
+	if curr.Kind() == reflect.Pointer {
 		actualCurrValue = curr.Elem()
 	}
 

@@ -29,6 +29,7 @@ import (
 	"strings"
 	"testing"
 
+	openapi_v2 "github.com/google/gnostic/openapiv2"
 	"github.com/spf13/cobra"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -41,6 +42,7 @@ import (
 	sptest "k8s.io/apimachinery/pkg/util/strategicpatch/testing"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/client-go/discovery"
 	dynamicfakeclient "k8s.io/client-go/dynamic/fake"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
@@ -52,20 +54,37 @@ import (
 )
 
 var (
-	fakeSchema                 = sptest.Fake{Path: filepath.Join("..", "..", "..", "testdata", "openapi", "swagger.json")}
-	testingOpenAPISchemaFns    = []func() (openapi.Resources, error){nil, AlwaysErrorOpenAPISchemaFn, openAPISchemaFn}
-	AlwaysErrorOpenAPISchemaFn = func() (openapi.Resources, error) {
-		return nil, errors.New("cannot get openapi spec")
+	fakeSchema                = sptest.Fake{Path: filepath.Join("..", "..", "..", "testdata", "openapi", "swagger.json")}
+	testingOpenAPISchemas     = []testOpenAPISchema{{OpenAPIGetter: &fakeSchema}, AlwaysErrorsOpenAPISchema, FakeOpenAPISchema}
+	AlwaysErrorsOpenAPISchema = testOpenAPISchema{
+		OpenAPISchemaFn: func() (openapi.Resources, error) {
+			return nil, errors.New("cannot get openapi spec")
+		},
+		OpenAPIGetter: &alwaysErrorsOpenAPISchema{},
 	}
-	openAPISchemaFn = func() (openapi.Resources, error) {
-		s, err := fakeSchema.OpenAPISchema()
-		if err != nil {
-			return nil, err
-		}
-		return openapi.NewOpenAPIData(s)
+	FakeOpenAPISchema = testOpenAPISchema{
+		OpenAPISchemaFn: func() (openapi.Resources, error) {
+			s, err := fakeSchema.OpenAPISchema()
+			if err != nil {
+				return nil, err
+			}
+			return openapi.NewOpenAPIData(s)
+		},
+		OpenAPIGetter: &fakeSchema,
 	}
 	codec = scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
 )
+
+type testOpenAPISchema struct {
+	OpenAPISchemaFn func() (openapi.Resources, error)
+	OpenAPIGetter   discovery.OpenAPISchemaInterface
+}
+
+type alwaysErrorsOpenAPISchema struct{}
+
+func (o *alwaysErrorsOpenAPISchema) OpenAPISchema() (*openapi_v2.Document, error) {
+	return nil, errors.New("cannot get openapi schema")
+}
 
 func TestApplyExtraArgsFail(t *testing.T) {
 	f := cmdtesting.NewTestFactory()
@@ -82,6 +101,80 @@ func validateApplyArgs(cmd *cobra.Command, args []string) error {
 		return cmdutil.UsageErrorf(cmd, "Unexpected args: %v", args)
 	}
 	return nil
+}
+
+func TestApplyFlagValidation(t *testing.T) {
+	f := cmdtesting.NewTestFactory()
+	defer f.Cleanup()
+
+	tests := []struct {
+		args        [][]string
+		expectedErr string
+	}{
+		{
+			args: [][]string{
+				{"force-conflicts", "true"},
+			},
+			expectedErr: "--force-conflicts only works with --server-side",
+		},
+		{
+			args: [][]string{
+				{"server-side", "true"},
+				{"dry-run", "client"},
+			},
+			expectedErr: "--dry-run=client doesn't work with --server-side (did you mean --dry-run=server instead?)",
+		},
+		{
+			args: [][]string{
+				{"force", "true"},
+				{"server-side", "true"},
+			},
+			expectedErr: "--force cannot be used with --server-side",
+		},
+		{
+			args: [][]string{
+				{"force", "true"},
+				{"dry-run", "server"},
+			},
+			expectedErr: "--dry-run=server cannot be used with --force",
+		},
+		{
+			args: [][]string{
+				{"all", "true"},
+				{"selector", "unused"},
+			},
+			expectedErr: "cannot set --all and --selector at the same time",
+		},
+		{
+			args: [][]string{
+				{"force", "true"},
+				{"prune", "true"},
+				{"all", "true"},
+			},
+			expectedErr: "--force cannot be used with --prune",
+		},
+	}
+
+	for _, test := range tests {
+		cmd := &cobra.Command{}
+		flags := NewApplyFlags(f, genericclioptions.NewTestIOStreamsDiscard())
+		flags.AddFlags(cmd)
+		cmd.Flags().Set("filename", "unused")
+		for _, arg := range test.args {
+			cmd.Flags().Set(arg[0], arg[1])
+		}
+		o, err := flags.ToOptions(cmd, "kubectl", []string{})
+		if err != nil {
+			t.Fatalf("unexpected error creating apply options: %s", err)
+		}
+		err = o.Validate()
+		if err == nil {
+			t.Fatalf("missing expected error")
+		}
+		if test.expectedErr != err.Error() {
+			t.Errorf("expected error %s, got %s", test.expectedErr, err)
+		}
+	}
 }
 
 const (
@@ -518,7 +611,7 @@ func TestApplyObject(t *testing.T) {
 	nameRC, currentRC := readAndAnnotateReplicationController(t, filenameRC)
 	pathRC := "/namespaces/test/replicationcontrollers/" + nameRC
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply when a local object is specified", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -540,7 +633,8 @@ func TestApplyObject(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -566,7 +660,7 @@ func TestApplyPruneObjects(t *testing.T) {
 	nameRC, currentRC := readAndAnnotateReplicationController(t, filenameRC)
 	pathRC := "/namespaces/test/replicationcontrollers/" + nameRC
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply returns correct output", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -588,7 +682,8 @@ func TestApplyPruneObjects(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -631,7 +726,7 @@ func TestApplyObjectOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply returns correct output", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -653,7 +748,8 @@ func TestApplyObjectOutput(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -680,7 +776,7 @@ func TestApplyRetry(t *testing.T) {
 	nameRC, currentRC := readAndAnnotateReplicationController(t, filenameRC)
 	pathRC := "/namespaces/test/replicationcontrollers/" + nameRC
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply retries on conflict error", func(t *testing.T) {
 			firstPatch := true
 			retry := false
@@ -714,7 +810,8 @@ func TestApplyRetry(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -860,7 +957,7 @@ func testApplyMultipleObjects(t *testing.T, asList bool) {
 	nameSVC, currentSVC := readAndAnnotateService(t, filenameSVC)
 	pathSVC := "/namespaces/test/services/" + nameSVC
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply on multiple objects", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -889,7 +986,8 @@ func testApplyMultipleObjects(t *testing.T, asList bool) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -941,7 +1039,7 @@ func TestApplyNULLPreservation(t *testing.T) {
 	verifiedPatch := false
 	deploymentBytes := readDeploymentFromFile(t, filenameDeployObjServerside)
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply preserves NULL fields", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -984,7 +1082,8 @@ func TestApplyNULLPreservation(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -1016,7 +1115,7 @@ func TestUnstructuredApply(t *testing.T) {
 
 	verifiedPatch := false
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply works correctly with unstructured objects", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -1050,7 +1149,8 @@ func TestUnstructuredApply(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -1084,7 +1184,7 @@ func TestUnstructuredIdempotentApply(t *testing.T) {
 	}
 	path := "/namespaces/test/widgets/widget"
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test repeated apply operations on an unstructured object", func(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -1115,7 +1215,8 @@ func TestUnstructuredIdempotentApply(t *testing.T) {
 					}
 				}),
 			}
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
 			ioStreams, _, buf, errBuf := genericclioptions.NewTestIOStreams()
@@ -1275,7 +1376,7 @@ func TestForceApply(t *testing.T) {
 		"post":        1,
 	}
 
-	for _, fn := range testingOpenAPISchemaFns {
+	for _, testingOpenAPISchema := range testingOpenAPISchemas {
 		t.Run("test apply with --force", func(t *testing.T) {
 			deleted := false
 			isScaledDownToZero := false
@@ -1357,7 +1458,8 @@ func TestForceApply(t *testing.T) {
 			}
 			fakeDynamicClient := dynamicfakeclient.NewSimpleDynamicClient(scheme)
 			tf.FakeDynamicClient = fakeDynamicClient
-			tf.OpenAPISchemaFunc = fn
+			tf.OpenAPISchemaFunc = testingOpenAPISchema.OpenAPISchemaFn
+			tf.FakeOpenAPIGetter = testingOpenAPISchema.OpenAPIGetter
 			tf.Client = tf.UnstructuredClient
 			tf.ClientConfigVal = &restclient.Config{}
 

@@ -17,14 +17,25 @@ limitations under the License.
 package util
 
 import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
+
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 )
 
 // SubCmdRunE returns a function that handles a case where a subcommand must be specified
@@ -86,4 +97,43 @@ func AddCRISocketFlag(flagSet *pflag.FlagSet, criSocket *string) {
 		criSocket, options.NodeCRISocket, *criSocket,
 		"Path to the CRI socket to connect. If empty kubeadm will try to auto-detect this value; use this option only if you have more than one CRI installed or if you have non-standard CRI socket.",
 	)
+}
+
+// DefaultInitConfiguration return default InitConfiguration. Avoid running the CRI auto-detection
+// code as we don't need it.
+func DefaultInitConfiguration() *kubeadmapiv1.InitConfiguration {
+	initCfg := &kubeadmapiv1.InitConfiguration{
+		NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
+			CRISocket: kubeadmconstants.UnknownCRISocket, // avoid CRI detection
+		},
+	}
+	return initCfg
+}
+
+// InteractivelyConfirmAction asks the user whether they _really_ want to take the action.
+func InteractivelyConfirmAction(action, question string, r io.Reader) error {
+	fmt.Printf("[%s] %s [y/N]: ", action, question)
+	scanner := bufio.NewScanner(r)
+	scanner.Scan()
+	if err := scanner.Err(); err != nil {
+		return errors.Wrap(err, "couldn't read from standard input")
+	}
+	answer := scanner.Text()
+	if strings.ToLower(answer) == "y" || strings.ToLower(answer) == "yes" {
+		return nil
+	}
+
+	return errors.New("won't proceed; the user didn't answer (Y|y) in order to continue")
+}
+
+// GetClientSet gets a real or fake client depending on whether the user is dry-running or not
+func GetClientset(file string, dryRun bool) (clientset.Interface, error) {
+	if dryRun {
+		dryRunGetter, err := apiclient.NewClientBackedDryRunGetterFromKubeconfig(file)
+		if err != nil {
+			return nil, err
+		}
+		return apiclient.NewDryRunClient(dryRunGetter, os.Stdout), nil
+	}
+	return kubeconfigutil.ClientSetFromFile(file)
 }

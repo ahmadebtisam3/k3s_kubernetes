@@ -18,19 +18,24 @@ package windows
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 )
 
 var _ = SIGDescribe("Services", func() {
 	f := framework.NewDefaultFramework("services")
+	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
 	var cs clientset.Interface
 
@@ -56,16 +61,26 @@ var _ = SIGDescribe("Services", func() {
 		nodePort := int(svc.Spec.Ports[0].NodePort)
 
 		ginkgo.By("creating Pod to be part of service " + serviceName)
-		_, err = jig.Run(nil)
+		// tweak the Jig to use windows...
+		windowsNodeSelectorTweak := func(rc *v1.ReplicationController) {
+			rc.Spec.Template.Spec.NodeSelector = map[string]string{
+				"kubernetes.io/os": "windows",
+			}
+		}
+		_, err = jig.Run(windowsNodeSelectorTweak)
 		framework.ExpectNoError(err)
 
 		//using hybrid_network methods
 		ginkgo.By("creating Windows testing Pod")
-		windowsPod := createTestPod(f, windowsBusyBoximage, windowsOS)
-		windowsPod = f.PodClient().CreateSync(windowsPod)
+		testPod := createTestPod(f, windowsBusyBoximage, windowsOS)
+		testPod = f.PodClient().CreateSync(testPod)
+
+		ginkgo.By("verifying that pod has the correct nodeSelector")
+		// Admission controllers may sometimes do the wrong thing
+		framework.ExpectEqual(testPod.Spec.NodeSelector["kubernetes.io/os"], "windows")
 
 		ginkgo.By(fmt.Sprintf("checking connectivity Pod to curl http://%s:%d", nodeIP, nodePort))
-		assertConsistentConnectivity(f, windowsPod.ObjectMeta.Name, windowsOS, windowsCheck(fmt.Sprintf("http://%s:%d", nodeIP, nodePort)))
+		assertConsistentConnectivity(f, testPod.ObjectMeta.Name, windowsOS, windowsCheck(fmt.Sprintf("http://%s", net.JoinHostPort(nodeIP, strconv.Itoa(nodePort)))))
 
 	})
 

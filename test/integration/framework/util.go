@@ -21,7 +21,6 @@ package framework
 import (
 	"context"
 	"fmt"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -31,8 +30,8 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	v1helper "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	nodectlr "k8s.io/kubernetes/pkg/controller/nodelifecycle"
 )
 
@@ -45,22 +44,22 @@ const (
 	singleCallTimeout = 5 * time.Minute
 )
 
-// CreateTestingNamespace creates a namespace for testing.
-func CreateTestingNamespace(baseName string, apiserver *httptest.Server, t *testing.T) *v1.Namespace {
-	// TODO: Create a namespace with a given basename.
-	// Currently we neither create the namespace nor delete all of its contents at the end.
-	// But as long as tests are not using the same namespaces, this should work fine.
-	return &v1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			// TODO: Once we start creating namespaces, switch to GenerateName.
-			Name: baseName,
-		},
+// CreateNamespaceOrDie creates a namespace.
+func CreateNamespaceOrDie(c clientset.Interface, baseName string, t *testing.T) *v1.Namespace {
+	ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: baseName}}
+	result, err := c.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create namespace: %v", err)
 	}
+	return result
 }
 
-// DeleteTestingNamespace is currently a no-op function.
-func DeleteTestingNamespace(ns *v1.Namespace, apiserver *httptest.Server, t *testing.T) {
-	// TODO: Remove all resources from a given namespace once we implement CreateTestingNamespace.
+// DeleteNamespaceOrDie deletes a namespace.
+func DeleteNamespaceOrDie(c clientset.Interface, ns *v1.Namespace, t *testing.T) {
+	err := c.CoreV1().Namespaces().Delete(context.TODO(), ns.Name, metav1.DeleteOptions{})
+	if err != nil {
+		t.Fatalf("Failed to delete namespace: %v", err)
+	}
 }
 
 // GetReadySchedulableNodes addresses the common use case of getting nodes you can do work on.
@@ -266,7 +265,8 @@ func isNodeUntainted(node *v1.Node) bool {
 		n = nodeCopy
 	}
 
-	return v1helper.TolerationsTolerateTaintsWithFilter(fakePod.Spec.Tolerations, n.Spec.Taints, func(t *v1.Taint) bool {
+	_, untolerated := v1helper.FindMatchingUntoleratedTaint(n.Spec.Taints, fakePod.Spec.Tolerations, func(t *v1.Taint) bool {
 		return t.Effect == v1.TaintEffectNoExecute || t.Effect == v1.TaintEffectNoSchedule
 	})
+	return !untolerated
 }

@@ -23,15 +23,16 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
 	"testing"
+	"time"
 
 	api "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/volume"
 )
 
 // TestMain starting point for all tests.
@@ -114,12 +115,13 @@ func TestSaveVolumeData(t *testing.T) {
 	for i, tc := range testCases {
 		t.Logf("test case: %s", tc.name)
 		specVolID := fmt.Sprintf("spec-volid-%d", i)
-		mountDir := filepath.Join(getTargetPath(testPodUID, specVolID, plug.host), "/mount")
+		targetPath := getTargetPath(testPodUID, specVolID, plug.host)
+		mountDir := filepath.Join(targetPath, "mount")
 		if err := os.MkdirAll(mountDir, 0755); err != nil && !os.IsNotExist(err) {
 			t.Errorf("failed to create dir [%s]: %v", mountDir, err)
 		}
 
-		err := saveVolumeData(path.Dir(mountDir), volDataFileName, tc.data)
+		err := saveVolumeData(targetPath, volDataFileName, tc.data)
 
 		if !tc.shouldFail && err != nil {
 			t.Errorf("unexpected failure: %v", err)
@@ -143,6 +145,52 @@ func TestSaveVolumeData(t *testing.T) {
 		}
 		if string(data) != jsonData.String() {
 			t.Errorf("expecting encoded data %v, got %v", string(data), jsonData)
+		}
+	}
+}
+
+func TestCreateCSIOperationContext(t *testing.T) {
+	testCases := []struct {
+		name     string
+		spec     *volume.Spec
+		migrated string
+	}{
+		{
+			name:     "test volume spec nil",
+			spec:     nil,
+			migrated: "false",
+		},
+		{
+			name: "test volume normal spec with migrated true",
+			spec: &volume.Spec{
+				Migrated: true,
+			},
+			migrated: "true",
+		},
+		{
+			name: "test volume normal spec with migrated false",
+			spec: &volume.Spec{
+				Migrated: false,
+			},
+			migrated: "false",
+		},
+	}
+	for _, tc := range testCases {
+		t.Logf("test case: %s", tc.name)
+		timeout := time.Minute
+		ctx, _ := createCSIOperationContext(tc.spec, timeout)
+
+		additionalInfoVal := ctx.Value(additionalInfoKey)
+		if additionalInfoVal == nil {
+			t.Error("Could not load additional info from context")
+		}
+		additionalInfoV, ok := additionalInfoVal.(additionalInfo)
+		if !ok {
+			t.Errorf("Additional info type assertion fail, additionalInfo object: %v", additionalInfoVal)
+		}
+		migrated := additionalInfoV.Migrated
+		if migrated != tc.migrated {
+			t.Errorf("Expect migrated value: %v, got: %v", tc.migrated, migrated)
 		}
 	}
 }

@@ -17,13 +17,13 @@ limitations under the License.
 package options
 
 import (
-	"net"
 	"reflect"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/spf13/pflag"
+	eventv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/diff"
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
@@ -35,6 +35,9 @@ import (
 	"k8s.io/component-base/metrics"
 	cmconfig "k8s.io/controller-manager/config"
 	cmoptions "k8s.io/controller-manager/options"
+	migration "k8s.io/controller-manager/pkg/leadermigration/options"
+	netutils "k8s.io/utils/net"
+
 	kubecontrollerconfig "k8s.io/kubernetes/cmd/kube-controller-manager/app/config"
 	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 	csrsigningconfig "k8s.io/kubernetes/pkg/controller/certificates/signer/config"
@@ -58,11 +61,11 @@ import (
 	statefulsetconfig "k8s.io/kubernetes/pkg/controller/statefulset/config"
 	ttlafterfinishedconfig "k8s.io/kubernetes/pkg/controller/ttlafterfinished/config"
 	attachdetachconfig "k8s.io/kubernetes/pkg/controller/volume/attachdetach/config"
+	ephemeralvolumeconfig "k8s.io/kubernetes/pkg/controller/volume/ephemeral/config"
 	persistentvolumeconfig "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/config"
 )
 
 var args = []string{
-	"--address=192.168.4.10",
 	"--allocate-node-cidrs=true",
 	"--attach-detach-reconcile-sync-period=30s",
 	"--cidr-allocator-type=CloudAllocator",
@@ -83,6 +86,7 @@ var args = []string{
 	"--concurrent-deployment-syncs=10",
 	"--concurrent-statefulset-syncs=15",
 	"--concurrent-endpoint-syncs=10",
+	"--concurrent-ephemeralvolume-syncs=10",
 	"--concurrent-service-endpoint-syncs=10",
 	"--concurrent-gc-syncs=30",
 	"--concurrent-namespace-syncs=20",
@@ -95,7 +99,6 @@ var args = []string{
 	"--contention-profiling=true",
 	"--controller-start-interval=2m",
 	"--controllers=foo,bar",
-	"--deployment-controller-sync-period=45s",
 	"--disable-attach-detach-reconcile-sync=true",
 	"--enable-dynamic-provisioning=false",
 	"--enable-garbage-collector=false",
@@ -136,7 +139,6 @@ var args = []string{
 	"--node-monitor-period=10s",
 	"--node-startup-grace-period=30s",
 	"--pod-eviction-timeout=2m",
-	"--port=10000",
 	"--profiling=false",
 	"--pv-recycler-increment-timeout-nfs=45",
 	"--pv-recycler-minimum-timeout-hostpath=45",
@@ -171,8 +173,7 @@ func TestAddFlags(t *testing.T) {
 	expected := &KubeControllerManagerOptions{
 		Generic: &cmoptions.GenericControllerManagerConfigurationOptions{
 			GenericControllerManagerConfiguration: &cmconfig.GenericControllerManagerConfiguration{
-				Port:            10252,     // Note: InsecureServingOptions.ApplyTo will write the flag value back into the component config
-				Address:         "0.0.0.0", // Note: InsecureServingOptions.ApplyTo will write the flag value back into the component config
+				Address:         "0.0.0.0", // Note: This field should have no effect in CM now, and "0.0.0.0" is the default value.
 				MinResyncPeriod: metav1.Duration{Duration: 8 * time.Hour},
 				ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
 					ContentType: "application/json",
@@ -197,6 +198,7 @@ func TestAddFlags(t *testing.T) {
 					EnableContentionProfiling: true,
 				},
 			},
+			LeaderMigration: &migration.LeaderMigrationOptions{},
 		},
 		KubeCloudShared: &cpoptions.KubeCloudSharedOptions{
 			KubeCloudSharedConfiguration: &cpconfig.KubeCloudSharedConfiguration{
@@ -257,8 +259,7 @@ func TestAddFlags(t *testing.T) {
 		},
 		DeploymentController: &DeploymentControllerOptions{
 			&deploymentconfig.DeploymentControllerConfiguration{
-				ConcurrentDeploymentSyncs:      10,
-				DeploymentControllerSyncPeriod: metav1.Duration{Duration: 45 * time.Second},
+				ConcurrentDeploymentSyncs: 10,
 			},
 		},
 		StatefulSetController: &StatefulSetControllerOptions{
@@ -267,10 +268,7 @@ func TestAddFlags(t *testing.T) {
 			},
 		},
 		DeprecatedFlags: &DeprecatedControllerOptions{
-			&kubectrlmgrconfig.DeprecatedControllerConfiguration{
-				DeletingPodsQPS:    0.1,
-				RegisterRetryCount: 10,
-			},
+			&kubectrlmgrconfig.DeprecatedControllerConfiguration{},
 		},
 		EndpointController: &EndpointControllerOptions{
 			&endpointconfig.EndpointControllerConfiguration{
@@ -289,11 +287,17 @@ func TestAddFlags(t *testing.T) {
 				MirroringMaxEndpointsPerSubset:          1000,
 			},
 		},
+		EphemeralVolumeController: &EphemeralVolumeControllerOptions{
+			&ephemeralvolumeconfig.EphemeralVolumeControllerConfiguration{
+				ConcurrentEphemeralVolumeSyncs: 10,
+			},
+		},
 		GarbageCollectorController: &GarbageCollectorControllerOptions{
 			&garbagecollectorconfig.GarbageCollectorControllerConfiguration{
 				ConcurrentGCSyncs: 30,
 				GCIgnoredResources: []garbagecollectorconfig.GroupResource{
 					{Group: "", Resource: "events"},
+					{Group: eventv1.GroupName, Resource: "events"},
 				},
 				EnableGarbageCollector: false,
 			},
@@ -307,7 +311,6 @@ func TestAddFlags(t *testing.T) {
 				HorizontalPodAutoscalerCPUInitializationPeriod:      metav1.Duration{Duration: 90 * time.Second},
 				HorizontalPodAutoscalerInitialReadinessDelay:        metav1.Duration{Duration: 50 * time.Second},
 				HorizontalPodAutoscalerTolerance:                    0.1,
-				HorizontalPodAutoscalerUseRESTClients:               true,
 			},
 		},
 		JobController: &JobControllerOptions{
@@ -398,21 +401,16 @@ func TestAddFlags(t *testing.T) {
 		},
 		SecureServing: (&apiserveroptions.SecureServingOptions{
 			BindPort:    10001,
-			BindAddress: net.ParseIP("192.168.4.21"),
+			BindAddress: netutils.ParseIPSloppy("192.168.4.21"),
 			ServerCert: apiserveroptions.GeneratableKeyCert{
 				CertDirectory: "/a/b/c",
 				PairName:      "kube-controller-manager",
 			},
 			HTTP2MaxStreamsPerConnection: 47,
 		}).WithLoopback(),
-		InsecureServing: (&apiserveroptions.DeprecatedInsecureServingOptions{
-			BindAddress: net.ParseIP("192.168.4.10"),
-			BindPort:    int(10000),
-			BindNetwork: "tcp",
-		}).WithLoopback(),
 		Authentication: &apiserveroptions.DelegatingAuthenticationOptions{
 			CacheTTL:            10 * time.Second,
-			ClientTimeout:       10 * time.Second,
+			TokenRequestTimeout: 10 * time.Second,
 			WebhookRetryBackoff: apiserveroptions.DefaultAuthWebhookRetryBackoff(),
 			ClientCert:          apiserveroptions.ClientCertAuthenticationOptions{},
 			RequestHeader: apiserveroptions.RequestHeaderAuthenticationOptions{
@@ -428,7 +426,8 @@ func TestAddFlags(t *testing.T) {
 			ClientTimeout:                10 * time.Second,
 			WebhookRetryBackoff:          apiserveroptions.DefaultAuthWebhookRetryBackoff(),
 			RemoteKubeConfigFileOptional: true,
-			AlwaysAllowPaths:             []string{"/healthz"}, // note: this does not match /healthz/ or /healthz/*
+			AlwaysAllowPaths:             []string{"/healthz", "/readyz", "/livez"}, // note: this does not match /healthz/ or /healthz/*
+			AlwaysAllowGroups:            []string{"system:masters"},
 		},
 		Kubeconfig: "/kubeconfig",
 		Master:     "192.168.4.20",
@@ -461,8 +460,7 @@ func TestApplyTo(t *testing.T) {
 	expected := &kubecontrollerconfig.Config{
 		ComponentConfig: kubectrlmgrconfig.KubeControllerManagerConfiguration{
 			Generic: cmconfig.GenericControllerManagerConfiguration{
-				Port:            10252,     // Note: InsecureServingOptions.ApplyTo will write the flag value back into the component config
-				Address:         "0.0.0.0", // Note: InsecureServingOptions.ApplyTo will write the flag value back into the component config
+				Address:         "0.0.0.0", // Note: This field should have no effect in CM now, and "0.0.0.0" is the default value.
 				MinResyncPeriod: metav1.Duration{Duration: 8 * time.Hour},
 				ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
 					ContentType: "application/json",
@@ -531,16 +529,12 @@ func TestApplyTo(t *testing.T) {
 				ConcurrentDaemonSetSyncs: 2,
 			},
 			DeploymentController: deploymentconfig.DeploymentControllerConfiguration{
-				ConcurrentDeploymentSyncs:      10,
-				DeploymentControllerSyncPeriod: metav1.Duration{Duration: 45 * time.Second},
+				ConcurrentDeploymentSyncs: 10,
 			},
 			StatefulSetController: statefulsetconfig.StatefulSetControllerConfiguration{
 				ConcurrentStatefulSetSyncs: 15,
 			},
-			DeprecatedController: kubectrlmgrconfig.DeprecatedControllerConfiguration{
-				DeletingPodsQPS:    0.1,
-				RegisterRetryCount: 10,
-			},
+			DeprecatedController: kubectrlmgrconfig.DeprecatedControllerConfiguration{},
 			EndpointController: endpointconfig.EndpointControllerConfiguration{
 				ConcurrentEndpointSyncs: 10,
 			},
@@ -552,10 +546,14 @@ func TestApplyTo(t *testing.T) {
 				MirroringConcurrentServiceEndpointSyncs: 2,
 				MirroringMaxEndpointsPerSubset:          1000,
 			},
+			EphemeralVolumeController: ephemeralvolumeconfig.EphemeralVolumeControllerConfiguration{
+				ConcurrentEphemeralVolumeSyncs: 10,
+			},
 			GarbageCollectorController: garbagecollectorconfig.GarbageCollectorControllerConfiguration{
 				ConcurrentGCSyncs: 30,
 				GCIgnoredResources: []garbagecollectorconfig.GroupResource{
 					{Group: "", Resource: "events"},
+					{Group: eventv1.GroupName, Resource: "events"},
 				},
 				EnableGarbageCollector: false,
 			},
@@ -567,7 +565,6 @@ func TestApplyTo(t *testing.T) {
 				HorizontalPodAutoscalerCPUInitializationPeriod:      metav1.Duration{Duration: 90 * time.Second},
 				HorizontalPodAutoscalerInitialReadinessDelay:        metav1.Duration{Duration: 50 * time.Second},
 				HorizontalPodAutoscalerTolerance:                    0.1,
-				HorizontalPodAutoscalerUseRESTClients:               true,
 			},
 			JobController: jobconfig.JobControllerConfiguration{
 				ConcurrentJobSyncs: 5,

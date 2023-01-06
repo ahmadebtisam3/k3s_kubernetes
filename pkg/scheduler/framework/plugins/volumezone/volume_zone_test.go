@@ -26,24 +26,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	fakeframework "k8s.io/kubernetes/pkg/scheduler/framework/fake"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 )
 
 func createPodWithVolume(pod, pv, pvc string) *v1.Pod {
-	return &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: pod, Namespace: "default"},
-		Spec: v1.PodSpec{
-			Volumes: []v1.Volume{
-				{
-					Name: pv,
-					VolumeSource: v1.VolumeSource{
-						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
-							ClaimName: pvc,
-						},
-					},
-				},
-			},
-		},
-	}
+	return st.MakePod().Name(pod).Namespace(metav1.NamespaceDefault).PVC(pvc).Obj()
 }
 
 func TestSingleZone(t *testing.T) {
@@ -100,9 +87,7 @@ func TestSingleZone(t *testing.T) {
 	}{
 		{
 			name: "pod without volume",
-			Pod: &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Name: "pod_1", Namespace: "default"},
-			},
+			Pod:  st.MakePod().Name("pod_1").Namespace(metav1.NamespaceDefault).Obj(),
 			Node: &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   "host1",
@@ -413,21 +398,21 @@ func TestWithBinding(t *testing.T) {
 			name: "unbound volume empty storage class",
 			Pod:  createPodWithVolume("pod_1", "vol_1", "PVC_EmptySC"),
 			Node: testNode,
-			wantStatus: framework.NewStatus(framework.Error,
+			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable,
 				"PersistentVolumeClaim had no pv name and storageClass name"),
 		},
 		{
 			name: "unbound volume no storage class",
 			Pod:  createPodWithVolume("pod_1", "vol_1", "PVC_NoSC"),
 			Node: testNode,
-			wantStatus: framework.NewStatus(framework.Error,
-				"StorageClass \"Class_0\" claimed by PersistentVolumeClaim \"PVC_NoSC\" not found"),
+			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable,
+				"unable to find storage class: Class_0"),
 		},
 		{
 			name:       "unbound volume immediate binding mode",
 			Pod:        createPodWithVolume("pod_1", "vol_1", "PVC_ImmediateSC"),
 			Node:       testNode,
-			wantStatus: framework.NewStatus(framework.Error, "VolumeBindingMode not set for StorageClass \"Class_Immediate\""),
+			wantStatus: framework.NewStatus(framework.UnschedulableAndUnresolvable, "VolumeBindingMode not set for StorageClass \"Class_Immediate\""),
 		},
 		{
 			name: "unbound volume wait binding mode",

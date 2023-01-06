@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"time"
 
+	policyv1 "k8s.io/api/policy/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,11 +32,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/util/dryrun"
-	policyclient "k8s.io/client-go/kubernetes/typed/policy/v1beta1"
+	"k8s.io/apiserver/pkg/util/feature"
+	policyclient "k8s.io/client-go/kubernetes/typed/policy/v1"
 	"k8s.io/client-go/util/retry"
+	pdbhelper "k8s.io/component-helpers/apps/poddisruptionbudget"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/policy"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 const (
@@ -69,15 +73,34 @@ type EvictionREST struct {
 
 var _ = rest.NamedCreater(&EvictionREST{})
 var _ = rest.GroupVersionKindProvider(&EvictionREST{})
+var _ = rest.GroupVersionAcceptor(&EvictionREST{})
+
+var v1Eviction = schema.GroupVersionKind{Group: "policy", Version: "v1", Kind: "Eviction"}
 
 // GroupVersionKind specifies a particular GroupVersionKind to discovery
 func (r *EvictionREST) GroupVersionKind(containingGV schema.GroupVersion) schema.GroupVersionKind {
-	return schema.GroupVersionKind{Group: "policy", Version: "v1beta1", Kind: "Eviction"}
+	return v1Eviction
+}
+
+// AcceptsGroupVersion indicates both v1 and v1beta1 Eviction objects are acceptable
+func (r *EvictionREST) AcceptsGroupVersion(gv schema.GroupVersion) bool {
+	switch gv {
+	case policyv1.SchemeGroupVersion, policyv1beta1.SchemeGroupVersion:
+		return true
+	default:
+		return false
+	}
 }
 
 // New creates a new eviction resource
 func (r *EvictionREST) New() runtime.Object {
 	return &policy.Eviction{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *EvictionREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // Propagate dry-run takes the dry-run option from the request and pushes it into the eviction object.
@@ -132,11 +155,10 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 	}
 
 	err = retry.OnError(EvictionsRetry, shouldRetry, func() error {
-		obj, err = r.store.Get(ctx, eviction.Name, &metav1.GetOptions{})
+		pod, err = getPod(r, ctx, eviction.Name)
 		if err != nil {
 			return err
 		}
-		pod = obj.(*api.Pod)
 
 		// Evicting a terminal pod should result in direct deletion of pod as it already caused disruption by the time we are evicting.
 		// There is no need to check for pdb.
@@ -157,7 +179,7 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 			deleteOptions = deleteOptions.DeepCopy()
 			setPreconditionsResourceVersion(deleteOptions, &pod.ResourceVersion)
 		}
-		_, _, err = r.store.Delete(ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
+		err = addConditionAndDeletePod(r, ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
 		if err != nil {
 			return err
 		}
@@ -255,7 +277,7 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 	}
 
 	// Try the delete
-	_, _, err = r.store.Delete(ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
+	err = addConditionAndDeletePod(r, ctx, eviction.Name, rest.ValidateAllObjectFunc, deleteOptions)
 	if err != nil {
 		if errors.IsConflict(err) && updateDeletionOptions &&
 			(originalDeleteOptions.Preconditions == nil || originalDeleteOptions.Preconditions.ResourceVersion == nil) {
@@ -269,6 +291,41 @@ func (r *EvictionREST) Create(ctx context.Context, name string, obj runtime.Obje
 
 	// Success!
 	return &metav1.Status{Status: metav1.StatusSuccess}, nil
+}
+
+func addConditionAndDeletePod(r *EvictionREST, ctx context.Context, name string, validation rest.ValidateObjectFunc, options *metav1.DeleteOptions) error {
+	if feature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
+		pod, err := getPod(r, ctx, name)
+		if err != nil {
+			return err
+		}
+		conditionAppender := func(_ context.Context, newObj, _ runtime.Object) (runtime.Object, error) {
+			podObj := newObj.(*api.Pod)
+			podutil.UpdatePodCondition(&podObj.Status, &api.PodCondition{
+				Type:    api.AlphaNoCompatGuaranteeDisruptionTarget,
+				Status:  api.ConditionTrue,
+				Reason:  "EvictionByEvictionAPI",
+				Message: "Eviction API: evicting",
+			})
+			return podObj, nil
+		}
+
+		podCopyUpdated := rest.DefaultUpdatedObjectInfo(pod, conditionAppender)
+
+		if _, _, err = r.store.Update(ctx, name, podCopyUpdated, rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+	}
+	_, _, err := r.store.Delete(ctx, name, rest.ValidateAllObjectFunc, options)
+	return err
+}
+
+func getPod(r *EvictionREST, ctx context.Context, name string) (*api.Pod, error) {
+	obj, err := r.store.Get(ctx, name, &metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*api.Pod), nil
 }
 
 func setPreconditionsResourceVersion(deleteOptions *metav1.DeleteOptions, resourceVersion *string) {
@@ -303,17 +360,17 @@ func resourceVersionIsUnset(options *metav1.DeleteOptions) bool {
 }
 
 func createTooManyRequestsError(name string) error {
-	// TODO(mml): Add a Retry-After header.  Once there are time-based
+	// TODO: Once there are time-based
 	// budgets, we can sometimes compute a sensible suggested value.  But
-	// even without that, we can give a suggestion (10 minutes?) that
+	// even without that, we can give a suggestion (even if small) that
 	// prevents well-behaved clients from hammering us.
-	err := errors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
-	err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: "DisruptionBudget", Message: fmt.Sprintf("The disruption budget %s is still being processed by the server.", name)})
+	err := errors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 10)
+	err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: policyv1.DisruptionBudgetCause, Message: fmt.Sprintf("The disruption budget %s is still being processed by the server.", name)})
 	return err
 }
 
 // checkAndDecrement checks if the provided PodDisruptionBudget allows any disruption.
-func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb policyv1beta1.PodDisruptionBudget, dryRun bool) error {
+func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb policyv1.PodDisruptionBudget, dryRun bool) error {
 	if pdb.Status.ObservedGeneration < pdb.Generation {
 
 		return createTooManyRequestsError(pdb.Name)
@@ -326,11 +383,15 @@ func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb p
 	}
 	if pdb.Status.DisruptionsAllowed == 0 {
 		err := errors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
-		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: "DisruptionBudget", Message: fmt.Sprintf("The disruption budget %s needs %d healthy pods and has %d currently", pdb.Name, pdb.Status.DesiredHealthy, pdb.Status.CurrentHealthy)})
+		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Type: policyv1.DisruptionBudgetCause, Message: fmt.Sprintf("The disruption budget %s needs %d healthy pods and has %d currently", pdb.Name, pdb.Status.DesiredHealthy, pdb.Status.CurrentHealthy)})
 		return err
 	}
 
 	pdb.Status.DisruptionsAllowed--
+	if pdb.Status.DisruptionsAllowed == 0 {
+		pdbhelper.UpdateDisruptionAllowedCondition(&pdb)
+	}
+
 	// If this is a dry-run, we don't need to go any further than that.
 	if dryRun == true {
 		return nil
@@ -353,23 +414,20 @@ func (r *EvictionREST) checkAndDecrement(namespace string, podName string, pdb p
 }
 
 // getPodDisruptionBudgets returns any PDBs that match the pod or err if there's an error.
-func (r *EvictionREST) getPodDisruptionBudgets(ctx context.Context, pod *api.Pod) ([]policyv1beta1.PodDisruptionBudget, error) {
-	if len(pod.Labels) == 0 {
-		return nil, nil
-	}
-
+func (r *EvictionREST) getPodDisruptionBudgets(ctx context.Context, pod *api.Pod) ([]policyv1.PodDisruptionBudget, error) {
 	pdbList, err := r.podDisruptionBudgetClient.PodDisruptionBudgets(pod.Namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	var pdbs []policyv1beta1.PodDisruptionBudget
+	var pdbs []policyv1.PodDisruptionBudget
 	for _, pdb := range pdbList.Items {
 		if pdb.Namespace != pod.Namespace {
 			continue
 		}
 		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 		if err != nil {
+			// This object has an invalid selector, it does not match the pod
 			continue
 		}
 		// If a PDB with a nil or empty selector creeps in, it should match nothing, not everything.

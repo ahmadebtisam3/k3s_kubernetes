@@ -25,6 +25,7 @@ import (
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
+	eventv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/controller-manager/pkg/informerfactory"
+
 	"k8s.io/kubernetes/pkg/controller/garbagecollector/metaonly"
 )
 
@@ -318,7 +320,8 @@ func (gb *GraphBuilder) Run(stopCh <-chan struct{}) {
 }
 
 var ignoredResources = map[schema.GroupResource]struct{}{
-	{Group: "", Resource: "events"}: {},
+	{Group: "", Resource: "events"}:                {},
+	{Group: eventv1.GroupName, Resource: "events"}: {},
 }
 
 // DefaultIgnoredResources returns the default set of resources that the garbage collector controller
@@ -392,6 +395,11 @@ func (gb *GraphBuilder) addDependentToOwners(n *node, owners []metav1.OwnerRefer
 					// n's owner reference doesn't match the observed identity, this might be wrong.
 					klog.V(2).Infof("node %s references an owner %s with coordinates that do not match the observed identity", n.identity, ownerNode.identity)
 				}
+				hasPotentiallyInvalidOwnerReference = true
+			} else if !ownerIsNamespaced && ownerNode.identity.Namespace != n.identity.Namespace && !ownerNode.isObserved() {
+				// the ownerNode is cluster-scoped and virtual, and does not match the child node's namespace.
+				// the owner could be a missing instance of a namespaced type incorrectly referenced by a cluster-scoped child (issue #98040).
+				// enqueue this child to attemptToDelete to verify parent references.
 				hasPotentiallyInvalidOwnerReference = true
 			}
 		}

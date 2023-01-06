@@ -42,6 +42,7 @@ import (
 	statefulsetconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/statefulset/config/v1alpha1"
 	ttlafterfinishedconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/ttlafterfinished/config/v1alpha1"
 	attachdetachconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/volume/attachdetach/config/v1alpha1"
+	ephemeralvolumeconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/volume/ephemeral/config/v1alpha1"
 	persistentvolumeconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/config/v1alpha1"
 )
 
@@ -50,10 +51,6 @@ func addDefaultingFuncs(scheme *kruntime.Scheme) error {
 }
 
 func SetDefaults_KubeControllerManagerConfiguration(obj *kubectrlmgrconfigv1alpha1.KubeControllerManagerConfiguration) {
-	if obj.DeprecatedController.RegisterRetryCount == 0 {
-		obj.DeprecatedController.RegisterRetryCount = 10
-	}
-
 	// These defaults override the recommended defaults from the componentbaseconfigv1alpha1 package that are applied automatically
 	// These client-connection defaults are specific to the kube-controller-manager
 	if obj.Generic.ClientConnection.QPS == 0.0 {
@@ -81,6 +78,8 @@ func SetDefaults_KubeControllerManagerConfiguration(obj *kubectrlmgrconfigv1alph
 	endpointsliceconfigv1alpha1.RecommendedDefaultEndpointSliceControllerConfiguration(&obj.EndpointSliceController)
 	// Use the default RecommendedDefaultEndpointSliceMirroringControllerConfiguration options
 	endpointslicemirroringconfigv1alpha1.RecommendedDefaultEndpointSliceMirroringControllerConfiguration(&obj.EndpointSliceMirroringController)
+	// Use the default RecommendedDefaultEphemeralVolumeControllerConfiguration options
+	ephemeralvolumeconfigv1alpha1.RecommendedDefaultEphemeralVolumeControllerConfiguration(&obj.EphemeralVolumeController)
 	// Use the default RecommendedDefaultGenericControllerManagerConfiguration options
 	garbagecollectorconfigv1alpha1.RecommendedDefaultGarbageCollectorControllerConfiguration(&obj.GarbageCollectorController)
 	// Use the default RecommendedDefaultJobControllerConfiguration options

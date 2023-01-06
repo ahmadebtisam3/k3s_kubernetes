@@ -23,15 +23,11 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
-
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/features"
+	netutils "k8s.io/utils/net"
 )
 
 type mockRangeRegistry struct {
@@ -60,10 +56,10 @@ func TestRepair(t *testing.T) {
 	ipregistry := &mockRangeRegistry{
 		item: &api.RangeAllocation{Range: "192.168.1.0/24"},
 	}
-	_, cidr, _ := net.ParseCIDR(ipregistry.item.Range)
-	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, nil, nil)
+	_, cidr, _ := netutils.ParseCIDRSloppy(ipregistry.item.Range)
+	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, nil, nil)
 
-	if err := r.RunOnce(); err != nil {
+	if err := r.runOnce(); err != nil {
 		t.Fatal(err)
 	}
 	if !ipregistry.updateCalled || ipregistry.updated == nil || ipregistry.updated.Range != cidr.String() || ipregistry.updated != ipregistry.item {
@@ -74,19 +70,19 @@ func TestRepair(t *testing.T) {
 		item:      &api.RangeAllocation{Range: "192.168.1.0/24"},
 		updateErr: fmt.Errorf("test error"),
 	}
-	r = NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, nil, nil)
-	if err := r.RunOnce(); !strings.Contains(err.Error(), ": test error") {
+	r = NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, nil, nil)
+	if err := r.runOnce(); !strings.Contains(err.Error(), ": test error") {
 		t.Fatal(err)
 	}
 }
 
 func TestRepairLeak(t *testing.T) {
-	_, cidr, _ := net.ParseCIDR("192.168.1.0/24")
-	previous, err := ipallocator.NewCIDRRange(cidr)
+	_, cidr, _ := netutils.ParseCIDRSloppy("192.168.1.0/24")
+	previous, err := ipallocator.NewInMemory(cidr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	previous.Allocate(net.ParseIP("192.168.1.10"))
+	previous.Allocate(netutils.ParseIPSloppy("192.168.1.10"))
 
 	var dst api.RangeAllocation
 	err = previous.Snapshot(&dst)
@@ -105,36 +101,36 @@ func TestRepairLeak(t *testing.T) {
 		},
 	}
 
-	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, nil, nil)
+	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, nil, nil)
 	// Run through the "leak detection holdoff" loops.
 	for i := 0; i < (numRepairsBeforeLeakCleanup - 1); i++ {
-		if err := r.RunOnce(); err != nil {
+		if err := r.runOnce(); err != nil {
 			t.Fatal(err)
 		}
 		after, err := ipallocator.NewFromSnapshot(ipregistry.updated)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !after.Has(net.ParseIP("192.168.1.10")) {
+		if !after.Has(netutils.ParseIPSloppy("192.168.1.10")) {
 			t.Errorf("expected ipallocator to still have leaked IP")
 		}
 	}
 	// Run one more time to actually remove the leak.
-	if err := r.RunOnce(); err != nil {
+	if err := r.runOnce(); err != nil {
 		t.Fatal(err)
 	}
 	after, err := ipallocator.NewFromSnapshot(ipregistry.updated)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Has(net.ParseIP("192.168.1.10")) {
+	if after.Has(netutils.ParseIPSloppy("192.168.1.10")) {
 		t.Errorf("expected ipallocator to not have leaked IP")
 	}
 }
 
 func TestRepairWithExisting(t *testing.T) {
-	_, cidr, _ := net.ParseCIDR("192.168.1.0/24")
-	previous, err := ipallocator.NewCIDRRange(cidr)
+	_, cidr, _ := netutils.ParseCIDRSloppy("192.168.1.0/24")
+	previous, err := ipallocator.NewInMemory(cidr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +147,7 @@ func TestRepairWithExisting(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.1.1",
 				ClusterIPs: []string{"192.168.1.1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{
@@ -159,7 +155,7 @@ func TestRepairWithExisting(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.1.100",
 				ClusterIPs: []string{"192.168.1.100"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{ // outside CIDR, will be dropped
@@ -167,7 +163,7 @@ func TestRepairWithExisting(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.0.1",
 				ClusterIPs: []string{"192.168.0.1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{ // empty, ignored
@@ -182,7 +178,7 @@ func TestRepairWithExisting(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.1.1",
 				ClusterIPs: []string{"192.168.1.1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{ // headless
@@ -203,15 +199,15 @@ func TestRepairWithExisting(t *testing.T) {
 			Data:  dst.Data,
 		},
 	}
-	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, nil, nil)
-	if err := r.RunOnce(); err != nil {
+	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, nil, nil)
+	if err := r.runOnce(); err != nil {
 		t.Fatal(err)
 	}
 	after, err := ipallocator.NewFromSnapshot(ipregistry.updated)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !after.Has(net.ParseIP("192.168.1.1")) || !after.Has(net.ParseIP("192.168.1.100")) {
+	if !after.Has(netutils.ParseIPSloppy("192.168.1.1")) || !after.Has(netutils.ParseIPSloppy("192.168.1.100")) {
 		t.Errorf("unexpected ipallocator state: %#v", after)
 	}
 	if free := after.Free(); free != 252 {
@@ -220,8 +216,8 @@ func TestRepairWithExisting(t *testing.T) {
 }
 
 func makeRangeRegistry(t *testing.T, cidrRange string) *mockRangeRegistry {
-	_, cidr, _ := net.ParseCIDR(cidrRange)
-	previous, err := ipallocator.NewCIDRRange(cidr)
+	_, cidr, _ := netutils.ParseCIDRSloppy(cidrRange)
+	previous, err := ipallocator.NewInMemory(cidr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,37 +243,37 @@ func makeFakeClientSet() *fake.Clientset {
 	return fake.NewSimpleClientset()
 }
 func makeIPNet(cidr string) *net.IPNet {
-	_, net, _ := net.ParseCIDR(cidr)
+	_, net, _ := netutils.ParseCIDRSloppy(cidr)
 	return net
 }
 func TestShouldWorkOnSecondary(t *testing.T) {
 	testCases := []struct {
 		name             string
-		expectedFamilies []v1.IPFamily
+		expectedFamilies []corev1.IPFamily
 		primaryNet       *net.IPNet
 		secondaryNet     *net.IPNet
 	}{
 		{
 			name:             "primary only (v4)",
-			expectedFamilies: []v1.IPFamily{v1.IPv4Protocol},
+			expectedFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			primaryNet:       makeIPNet("10.0.0.0/16"),
 			secondaryNet:     nil,
 		},
 		{
 			name:             "primary only (v6)",
-			expectedFamilies: []v1.IPFamily{v1.IPv6Protocol},
+			expectedFamilies: []corev1.IPFamily{corev1.IPv6Protocol},
 			primaryNet:       makeIPNet("2000::/120"),
 			secondaryNet:     nil,
 		},
 		{
 			name:             "primary and secondary provided (v4,v6)",
-			expectedFamilies: []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+			expectedFamilies: []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
 			primaryNet:       makeIPNet("10.0.0.0/16"),
 			secondaryNet:     makeIPNet("2000::/120"),
 		},
 		{
 			name:             "primary and secondary provided (v6,v4)",
-			expectedFamilies: []v1.IPFamily{v1.IPv6Protocol, v1.IPv4Protocol},
+			expectedFamilies: []corev1.IPFamily{corev1.IPv6Protocol, corev1.IPv4Protocol},
 			primaryNet:       makeIPNet("2000::/120"),
 			secondaryNet:     makeIPNet("10.0.0.0/16"),
 		},
@@ -293,12 +289,12 @@ func TestShouldWorkOnSecondary(t *testing.T) {
 				secondaryRegistry = makeRangeRegistry(t, tc.secondaryNet.String())
 			}
 
-			repair := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), tc.primaryNet, primaryRegistry, tc.secondaryNet, secondaryRegistry)
+			repair := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), tc.primaryNet, primaryRegistry, tc.secondaryNet, secondaryRegistry)
 			if len(repair.allocatorByFamily) != len(tc.expectedFamilies) {
 				t.Fatalf("expected to have allocator by family count:%v got %v", len(tc.expectedFamilies), len(repair.allocatorByFamily))
 			}
 
-			seen := make(map[v1.IPFamily]bool)
+			seen := make(map[corev1.IPFamily]bool)
 			for _, family := range tc.expectedFamilies {
 				familySeen := true
 
@@ -327,8 +323,6 @@ func TestShouldWorkOnSecondary(t *testing.T) {
 }
 
 func TestRepairDualStack(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, true)()
-
 	fakeClient := fake.NewSimpleClientset()
 	ipregistry := &mockRangeRegistry{
 		item: &api.RangeAllocation{Range: "192.168.1.0/24"},
@@ -337,11 +331,11 @@ func TestRepairDualStack(t *testing.T) {
 		item: &api.RangeAllocation{Range: "2000::/108"},
 	}
 
-	_, cidr, _ := net.ParseCIDR(ipregistry.item.Range)
-	_, secondaryCIDR, _ := net.ParseCIDR(secondaryIPRegistry.item.Range)
-	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
+	_, cidr, _ := netutils.ParseCIDRSloppy(ipregistry.item.Range)
+	_, secondaryCIDR, _ := netutils.ParseCIDRSloppy(secondaryIPRegistry.item.Range)
+	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
 
-	if err := r.RunOnce(); err != nil {
+	if err := r.runOnce(); err != nil {
 		t.Fatal(err)
 	}
 	if !ipregistry.updateCalled || ipregistry.updated == nil || ipregistry.updated.Range != cidr.String() || ipregistry.updated != ipregistry.item {
@@ -360,29 +354,27 @@ func TestRepairDualStack(t *testing.T) {
 		updateErr: fmt.Errorf("test error"),
 	}
 
-	r = NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
-	if err := r.RunOnce(); !strings.Contains(err.Error(), ": test error") {
+	r = NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
+	if err := r.runOnce(); !strings.Contains(err.Error(), ": test error") {
 		t.Fatal(err)
 	}
 }
 
 func TestRepairLeakDualStack(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, true)()
-
-	_, cidr, _ := net.ParseCIDR("192.168.1.0/24")
-	previous, err := ipallocator.NewCIDRRange(cidr)
+	_, cidr, _ := netutils.ParseCIDRSloppy("192.168.1.0/24")
+	previous, err := ipallocator.NewInMemory(cidr)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	previous.Allocate(net.ParseIP("192.168.1.10"))
+	previous.Allocate(netutils.ParseIPSloppy("192.168.1.10"))
 
-	_, secondaryCIDR, _ := net.ParseCIDR("2000::/108")
-	secondaryPrevious, err := ipallocator.NewCIDRRange(secondaryCIDR)
+	_, secondaryCIDR, _ := netutils.ParseCIDRSloppy("2000::/108")
+	secondaryPrevious, err := ipallocator.NewInMemory(secondaryCIDR)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondaryPrevious.Allocate(net.ParseIP("2000::1"))
+	secondaryPrevious.Allocate(netutils.ParseIPSloppy("2000::1"))
 
 	var dst api.RangeAllocation
 	err = previous.Snapshot(&dst)
@@ -417,29 +409,29 @@ func TestRepairLeakDualStack(t *testing.T) {
 		},
 	}
 
-	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
+	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
 	// Run through the "leak detection holdoff" loops.
 	for i := 0; i < (numRepairsBeforeLeakCleanup - 1); i++ {
-		if err := r.RunOnce(); err != nil {
+		if err := r.runOnce(); err != nil {
 			t.Fatal(err)
 		}
 		after, err := ipallocator.NewFromSnapshot(ipregistry.updated)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !after.Has(net.ParseIP("192.168.1.10")) {
+		if !after.Has(netutils.ParseIPSloppy("192.168.1.10")) {
 			t.Errorf("expected ipallocator to still have leaked IP")
 		}
 		secondaryAfter, err := ipallocator.NewFromSnapshot(secondaryIPRegistry.updated)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !secondaryAfter.Has(net.ParseIP("2000::1")) {
+		if !secondaryAfter.Has(netutils.ParseIPSloppy("2000::1")) {
 			t.Errorf("expected ipallocator to still have leaked IP")
 		}
 	}
 	// Run one more time to actually remove the leak.
-	if err := r.RunOnce(); err != nil {
+	if err := r.runOnce(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -447,14 +439,14 @@ func TestRepairLeakDualStack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Has(net.ParseIP("192.168.1.10")) {
+	if after.Has(netutils.ParseIPSloppy("192.168.1.10")) {
 		t.Errorf("expected ipallocator to not have leaked IP")
 	}
 	secondaryAfter, err := ipallocator.NewFromSnapshot(secondaryIPRegistry.updated)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if secondaryAfter.Has(net.ParseIP("2000::1")) {
+	if secondaryAfter.Has(netutils.ParseIPSloppy("2000::1")) {
 		t.Errorf("expected ipallocator to not have leaked IP")
 	}
 }
@@ -465,15 +457,14 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 	// we can saftly create tests that has ipFamilyPolicy:nil
 	// this will work every where except alloc & validation
 
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, true)()
-	_, cidr, _ := net.ParseCIDR("192.168.1.0/24")
-	previous, err := ipallocator.NewCIDRRange(cidr)
+	_, cidr, _ := netutils.ParseCIDRSloppy("192.168.1.0/24")
+	previous, err := ipallocator.NewInMemory(cidr)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, secondaryCIDR, _ := net.ParseCIDR("2000::/108")
-	secondaryPrevious, err := ipallocator.NewCIDRRange(secondaryCIDR)
+	_, secondaryCIDR, _ := netutils.ParseCIDRSloppy("2000::/108")
+	secondaryPrevious, err := ipallocator.NewInMemory(secondaryCIDR)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +487,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.1.1",
 				ClusterIPs: []string{"192.168.1.1", "2000::1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
 			},
 		},
 		&corev1.Service{
@@ -504,7 +495,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "2000::1",
 				ClusterIPs: []string{"2000::1", "192.168.1.100"},
-				IPFamilies: []v1.IPFamily{v1.IPv6Protocol, v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol, corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{
@@ -512,7 +503,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "2000::2",
 				ClusterIPs: []string{"2000::2"},
-				IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol},
 			},
 		},
 		&corev1.Service{
@@ -520,7 +511,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.1.90",
 				ClusterIPs: []string{"192.168.1.90"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		// outside CIDR, will be dropped
@@ -529,7 +520,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.0.1",
 				ClusterIPs: []string{"192.168.0.1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{ // outside CIDR, will be dropped
@@ -537,7 +528,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "3000::1",
 				ClusterIPs: []string{"3000::1"},
-				IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol},
 			},
 		},
 		&corev1.Service{
@@ -545,7 +536,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.0.1",
 				ClusterIPs: []string{"192.168.0.1", "3000::1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
 			},
 		},
 		&corev1.Service{
@@ -553,7 +544,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "3000::1",
 				ClusterIPs: []string{"3000::1", "192.168.0.1"},
-				IPFamilies: []v1.IPFamily{v1.IPv6Protocol, v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol, corev1.IPv4Protocol},
 			},
 		},
 
@@ -566,7 +557,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "192.168.1.1",
 				ClusterIPs: []string{"192.168.1.1"},
-				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv4Protocol},
 			},
 		},
 		&corev1.Service{ // duplicate, dropped
@@ -574,7 +565,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 			Spec: corev1.ServiceSpec{
 				ClusterIP:  "2000::2",
 				ClusterIPs: []string{"2000::2"},
-				IPFamilies: []v1.IPFamily{v1.IPv6Protocol},
+				IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol},
 			},
 		},
 
@@ -604,8 +595,8 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 		},
 	}
 
-	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.CoreV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
-	if err := r.RunOnce(); err != nil {
+	r := NewRepair(0, fakeClient.CoreV1(), fakeClient.EventsV1(), cidr, ipregistry, secondaryCIDR, secondaryIPRegistry)
+	if err := r.runOnce(); err != nil {
 		t.Fatal(err)
 	}
 	after, err := ipallocator.NewFromSnapshot(ipregistry.updated)
@@ -613,7 +604,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !after.Has(net.ParseIP("192.168.1.1")) || !after.Has(net.ParseIP("192.168.1.100")) {
+	if !after.Has(netutils.ParseIPSloppy("192.168.1.1")) || !after.Has(netutils.ParseIPSloppy("192.168.1.100")) {
 		t.Errorf("unexpected ipallocator state: %#v", after)
 	}
 	if free := after.Free(); free != 251 {
@@ -624,7 +615,7 @@ func TestRepairWithExistingDualStack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !secondaryAfter.Has(net.ParseIP("2000::1")) || !secondaryAfter.Has(net.ParseIP("2000::2")) {
+	if !secondaryAfter.Has(netutils.ParseIPSloppy("2000::1")) || !secondaryAfter.Has(netutils.ParseIPSloppy("2000::2")) {
 		t.Errorf("unexpected ipallocator state: %#v", secondaryAfter)
 	}
 	if free := secondaryAfter.Free(); free != 65533 {

@@ -20,9 +20,8 @@ import (
 	"net"
 	"testing"
 
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/features"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	netutils "k8s.io/utils/net"
 )
 
 func makeOptionsWithCIDRs(serviceCIDR string, secondaryServiceCIDR string) *ServerRunOptions {
@@ -33,14 +32,14 @@ func makeOptionsWithCIDRs(serviceCIDR string, secondaryServiceCIDR string) *Serv
 
 	var primaryCIDR, secondaryCIDR net.IPNet
 	if len(serviceCIDR) > 0 {
-		_, cidr, _ := net.ParseCIDR(serviceCIDR)
+		_, cidr, _ := netutils.ParseCIDRSloppy(serviceCIDR)
 		if cidr != nil {
 			primaryCIDR = *(cidr)
 		}
 	}
 
 	if len(secondaryServiceCIDR) > 0 {
-		_, cidr, _ := net.ParseCIDR(secondaryServiceCIDR)
+		_, cidr, _ := netutils.ParseCIDRSloppy(secondaryServiceCIDR)
 		if cidr != nil {
 			secondaryCIDR = *(cidr)
 		}
@@ -52,109 +51,68 @@ func makeOptionsWithCIDRs(serviceCIDR string, secondaryServiceCIDR string) *Serv
 	}
 }
 
-func TestClusterSerivceIPRange(t *testing.T) {
+func TestClusterServiceIPRange(t *testing.T) {
 	testCases := []struct {
-		name                string
-		options             *ServerRunOptions
-		enableDualStack     bool
-		enableEndpointSlice bool
-		expectErrors        bool
+		name         string
+		options      *ServerRunOptions
+		expectErrors bool
 	}{
 		{
-			name:            "no service cidr",
-			expectErrors:    true,
-			options:         makeOptionsWithCIDRs("", ""),
-			enableDualStack: false,
+			name:         "no service cidr",
+			expectErrors: true,
+			options:      makeOptionsWithCIDRs("", ""),
 		},
 		{
-			name:                "only secondary service cidr, dual stack gate on",
-			expectErrors:        true,
-			options:             makeOptionsWithCIDRs("", "10.0.0.0/16"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
+			name:         "only secondary service cidr",
+			expectErrors: true,
+			options:      makeOptionsWithCIDRs("", "10.0.0.0/16"),
 		},
 		{
-			name:            "only secondary service cidr, dual stack gate off",
-			expectErrors:    true,
-			options:         makeOptionsWithCIDRs("", "10.0.0.0/16"),
-			enableDualStack: false,
+			name:         "primary and secondary are provided but not dual stack v4-v4",
+			expectErrors: true,
+			options:      makeOptionsWithCIDRs("10.0.0.0/16", "11.0.0.0/16"),
 		},
 		{
-			name:                "primary and secondary are provided but not dual stack v4-v4",
-			expectErrors:        true,
-			options:             makeOptionsWithCIDRs("10.0.0.0/16", "11.0.0.0/16"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
+			name:         "primary and secondary are provided but not dual stack v6-v6",
+			expectErrors: true,
+			options:      makeOptionsWithCIDRs("2000::/108", "3000::/108"),
 		},
 		{
-			name:                "primary and secondary are provided but not dual stack v6-v6",
-			expectErrors:        true,
-			options:             makeOptionsWithCIDRs("2000::/108", "3000::/108"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
+			name:         "service cidr is too big",
+			expectErrors: true,
+			options:      makeOptionsWithCIDRs("10.0.0.0/8", ""),
 		},
 		{
-			name:            "valid dual stack with gate disabled",
-			expectErrors:    true,
-			options:         makeOptionsWithCIDRs("10.0.0.0/16", "3000::/108"),
-			enableDualStack: false,
-		},
-		{
-			name:                "service cidr is too big",
-			expectErrors:        true,
-			options:             makeOptionsWithCIDRs("10.0.0.0/8", ""),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
-		},
-		{
-			name:                "dual-stack secondary cidr too big",
-			expectErrors:        true,
-			options:             makeOptionsWithCIDRs("10.0.0.0/16", "3000::/64"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
-		},
-		{
-			name:                "valid v6-v4 dual stack + gate on + endpointSlice gate is on",
-			expectErrors:        false,
-			options:             makeOptionsWithCIDRs("3000::/108", "10.0.0.0/16"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
+			name:         "dual-stack secondary cidr too big",
+			expectErrors: true,
+			options:      makeOptionsWithCIDRs("10.0.0.0/16", "3000::/64"),
 		},
 
-		{
-			name:                "valid v4-v6 dual stack + gate on + endpointSlice is off",
-			expectErrors:        true,
-			options:             makeOptionsWithCIDRs("10.0.0.0/16", "3000::/108"),
-			enableDualStack:     true,
-			enableEndpointSlice: false,
-		},
 		/* success cases */
 		{
-			name:            "valid primary",
-			expectErrors:    false,
-			options:         makeOptionsWithCIDRs("10.0.0.0/16", ""),
-			enableDualStack: false,
+			name:         "valid primary",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("10.0.0.0/16", ""),
 		},
 		{
-			name:                "valid v4-v6 dual stack + gate on",
-			expectErrors:        false,
-			options:             makeOptionsWithCIDRs("10.0.0.0/16", "3000::/108"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
+			name:         "valid primary, class E range",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("244.0.0.0/16", ""),
 		},
 		{
-			name:                "valid v6-v4 dual stack + gate on",
-			expectErrors:        false,
-			options:             makeOptionsWithCIDRs("3000::/108", "10.0.0.0/16"),
-			enableDualStack:     true,
-			enableEndpointSlice: true,
+			name:         "valid v4-v6 dual stack",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("10.0.0.0/16", "3000::/108"),
+		},
+		{
+			name:         "valid v6-v4 dual stack",
+			expectErrors: false,
+			options:      makeOptionsWithCIDRs("3000::/108", "10.0.0.0/16"),
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, tc.enableDualStack)()
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EndpointSlice, tc.enableEndpointSlice)()
 			errs := validateClusterIPFlags(tc.options)
 			if len(errs) > 0 && !tc.expectErrors {
 				t.Errorf("expected no errors, errors found %+v", errs)
@@ -168,8 +126,67 @@ func TestClusterSerivceIPRange(t *testing.T) {
 }
 
 func getIPnetFromCIDR(cidr string) *net.IPNet {
-	_, ipnet, _ := net.ParseCIDR(cidr)
+	_, ipnet, _ := netutils.ParseCIDRSloppy(cidr)
 	return ipnet
+}
+
+func TestValidateServiceNodePort(t *testing.T) {
+	testCases := []struct {
+		name         string
+		options      *ServerRunOptions
+		expectErrors bool
+	}{
+		{
+			name:         "validate port less than 0",
+			options:      makeOptionsWithPort(-1, 30065, 1),
+			expectErrors: true,
+		},
+		{
+			name:         "validate port more than 65535",
+			options:      makeOptionsWithPort(65536, 30065, 1),
+			expectErrors: true,
+		},
+		{
+			name:         "validate port equal 0",
+			options:      makeOptionsWithPort(0, 0, 1),
+			expectErrors: true,
+		},
+		{
+			name:         "validate port less than base",
+			options:      makeOptionsWithPort(30064, 30065, 1),
+			expectErrors: true,
+		},
+		{
+			name:         "validate port minus base more than size",
+			options:      makeOptionsWithPort(30067, 30065, 1),
+			expectErrors: true,
+		},
+		{
+			name:         "validate success",
+			options:      makeOptionsWithPort(30067, 30065, 5),
+			expectErrors: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateServiceNodePort(tc.options)
+			if err != nil && !tc.expectErrors {
+				t.Errorf("expected no errors, error found %+v", err)
+			}
+		})
+	}
+}
+
+func makeOptionsWithPort(kubernetesServiceNodePort int, base int, size int) *ServerRunOptions {
+	var portRange = utilnet.PortRange{
+		Base: base,
+		Size: size,
+	}
+	return &ServerRunOptions{
+		ServiceNodePortRange:      portRange,
+		KubernetesServiceNodePort: kubernetesServiceNodePort,
+	}
 }
 
 func TestValidateMaxCIDRRange(t *testing.T) {

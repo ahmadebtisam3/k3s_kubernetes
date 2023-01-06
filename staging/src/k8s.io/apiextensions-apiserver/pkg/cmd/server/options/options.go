@@ -23,6 +23,7 @@ import (
 	"net/url"
 
 	"github.com/spf13/pflag"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
@@ -31,18 +32,18 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic"
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/apiserver/pkg/server/options"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/apiserver/pkg/util/proxy"
 	"k8s.io/apiserver/pkg/util/webhook"
 	corev1 "k8s.io/client-go/listers/core/v1"
+	netutils "k8s.io/utils/net"
 )
 
 const defaultEtcdPathPrefix = "/registry/apiextensions.kubernetes.io"
 
 // CustomResourceDefinitionsServerOptions describes the runtime options of an apiextensions-apiserver.
 type CustomResourceDefinitionsServerOptions struct {
-	ServerRunOptions   *options.ServerRunOptions
+	ServerRunOptions   *genericoptions.ServerRunOptions
 	RecommendedOptions *genericoptions.RecommendedOptions
 	APIEnablement      *genericoptions.APIEnablementOptions
 
@@ -53,7 +54,7 @@ type CustomResourceDefinitionsServerOptions struct {
 // NewCustomResourceDefinitionsServerOptions creates default options of an apiextensions-apiserver.
 func NewCustomResourceDefinitionsServerOptions(out, errOut io.Writer) *CustomResourceDefinitionsServerOptions {
 	o := &CustomResourceDefinitionsServerOptions{
-		ServerRunOptions: options.NewServerRunOptions(),
+		ServerRunOptions: genericoptions.NewServerRunOptions(),
 		RecommendedOptions: genericoptions.NewRecommendedOptions(
 			defaultEtcdPathPrefix,
 			apiserver.Codecs.LegacyCodec(v1beta1.SchemeGroupVersion, v1.SchemeGroupVersion),
@@ -91,7 +92,7 @@ func (o *CustomResourceDefinitionsServerOptions) Complete() error {
 // Config returns an apiextensions-apiserver configuration.
 func (o CustomResourceDefinitionsServerOptions) Config() (*apiserver.Config, error) {
 	// TODO have a "real" external address
-	if err := o.RecommendedOptions.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
+	if err := o.RecommendedOptions.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{netutils.ParseIPSloppy("127.0.0.1")}); err != nil {
 		return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
 	}
 
@@ -111,7 +112,7 @@ func (o CustomResourceDefinitionsServerOptions) Config() (*apiserver.Config, err
 		ExtraConfig: apiserver.ExtraConfig{
 			CRDRESTOptionsGetter: NewCRDRESTOptionsGetter(*o.RecommendedOptions.Etcd),
 			ServiceResolver:      &serviceResolver{serverConfig.SharedInformerFactory.Core().V1().Services().Lister()},
-			AuthResolverWrapper:  webhook.NewDefaultAuthenticationInfoResolverWrapper(nil, nil, serverConfig.LoopbackClientConfig),
+			AuthResolverWrapper:  webhook.NewDefaultAuthenticationInfoResolverWrapper(nil, nil, serverConfig.LoopbackClientConfig, oteltrace.NewNoopTracerProvider()),
 		},
 	}
 	return config, nil
@@ -120,13 +121,14 @@ func (o CustomResourceDefinitionsServerOptions) Config() (*apiserver.Config, err
 // NewCRDRESTOptionsGetter create a RESTOptionsGetter for CustomResources.
 func NewCRDRESTOptionsGetter(etcdOptions genericoptions.EtcdOptions) genericregistry.RESTOptionsGetter {
 	ret := apiserver.CRDRESTOptionsGetter{
-		StorageConfig:           etcdOptions.StorageConfig,
-		StoragePrefix:           etcdOptions.StorageConfig.Prefix,
-		EnableWatchCache:        etcdOptions.EnableWatchCache,
-		DefaultWatchCacheSize:   etcdOptions.DefaultWatchCacheSize,
-		EnableGarbageCollection: etcdOptions.EnableGarbageCollection,
-		DeleteCollectionWorkers: etcdOptions.DeleteCollectionWorkers,
-		CountMetricPollPeriod:   etcdOptions.StorageConfig.CountMetricPollPeriod,
+		StorageConfig:             etcdOptions.StorageConfig,
+		StoragePrefix:             etcdOptions.StorageConfig.Prefix,
+		EnableWatchCache:          etcdOptions.EnableWatchCache,
+		DefaultWatchCacheSize:     etcdOptions.DefaultWatchCacheSize,
+		EnableGarbageCollection:   etcdOptions.EnableGarbageCollection,
+		DeleteCollectionWorkers:   etcdOptions.DeleteCollectionWorkers,
+		CountMetricPollPeriod:     etcdOptions.StorageConfig.CountMetricPollPeriod,
+		StorageObjectCountTracker: etcdOptions.StorageConfig.StorageObjectCountTracker,
 	}
 	ret.StorageConfig.Codec = unstructured.UnstructuredJSONScheme
 

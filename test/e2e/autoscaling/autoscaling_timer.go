@@ -21,26 +21,32 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2eautoscaling "k8s.io/kubernetes/test/e2e/framework/autoscaling"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega/gmeasure"
 )
 
 var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling", func() {
 	f := framework.NewDefaultFramework("autoscaling")
+	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	var experiment *gmeasure.Experiment
 
-	SIGDescribe("Autoscaling a service", func() {
+	ginkgo.Describe("Autoscaling a service", func() {
 		ginkgo.BeforeEach(func() {
 			// Check if Cloud Autoscaler is enabled by trying to get its ConfigMap.
 			_, err := f.ClientSet.CoreV1().ConfigMaps("kube-system").Get(context.TODO(), "cluster-autoscaler-status", metav1.GetOptions{})
 			if err != nil {
 				e2eskipper.Skipf("test expects Cluster Autoscaler to be enabled")
 			}
+			experiment = gmeasure.NewExperiment("Autoscaling a service")
+			ginkgo.AddReportEntry(experiment.Name, experiment)
 		})
 
 		ginkgo.Context("from 1 pod and 3 nodes to 8 pods and >=4 nodes", func() {
@@ -80,7 +86,7 @@ var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling"
 				}
 			})
 
-			ginkgo.Measure("takes less than 15 minutes", func(b ginkgo.Benchmarker) {
+			ginkgo.It("takes less than 15 minutes", func() {
 				// Measured over multiple samples, scaling takes 10 +/- 2 minutes, so 15 minutes should be fully sufficient.
 				const timeToWait = 15 * time.Minute
 
@@ -96,7 +102,7 @@ var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling"
 				nodeMemoryMB := (&nodeMemoryBytes).Value() / 1024 / 1024
 				memRequestMB := nodeMemoryMB / 10 // Ensure each pod takes not more than 10% of node's allocatable memory.
 				replicas := 1
-				resourceConsumer := e2eautoscaling.NewDynamicResourceConsumer("resource-consumer", f.Namespace.Name, e2eautoscaling.KindDeployment, replicas, 0, 0, 0, cpuRequestMillis, memRequestMB, f.ClientSet, f.ScalesGetter)
+				resourceConsumer := e2eautoscaling.NewDynamicResourceConsumer("resource-consumer", f.Namespace.Name, e2eautoscaling.KindDeployment, replicas, 0, 0, 0, cpuRequestMillis, memRequestMB, f.ClientSet, f.ScalesGetter, e2eautoscaling.Disable, e2eautoscaling.Idle)
 				defer resourceConsumer.CleanUp()
 				resourceConsumer.WaitForReplicas(replicas, 1*time.Minute) // Should finish ~immediately, so 1 minute is more than enough.
 
@@ -109,10 +115,10 @@ var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling"
 				resourceConsumer.ConsumeCPU(int(cpuLoad))
 
 				// Measure the time it takes for the service to scale to 8 pods with 50% CPU utilization each.
-				b.Time("total scale-up time", func() {
+				experiment.SampleDuration("total scale-up time", func(idx int) {
 					resourceConsumer.WaitForReplicas(8, timeToWait)
-				})
-			}, 1) // Increase to run the test more than once.
+				}, gmeasure.SamplingConfig{N: 1})
+			}) // Increase to run the test more than once.
 		})
 	})
 })

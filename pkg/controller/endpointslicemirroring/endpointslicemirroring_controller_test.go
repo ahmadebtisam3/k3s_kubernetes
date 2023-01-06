@@ -23,14 +23,16 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
 )
 
@@ -52,11 +54,16 @@ func newController(batchPeriod time.Duration) (*fake.Clientset, *endpointSliceMi
 
 	esController := NewController(
 		informerFactory.Core().V1().Endpoints(),
-		informerFactory.Discovery().V1beta1().EndpointSlices(),
+		informerFactory.Discovery().V1().EndpointSlices(),
 		informerFactory.Core().V1().Services(),
 		int32(1000),
 		client,
 		batchPeriod)
+
+	// The event processing pipeline is normally started via Run() method.
+	// However, since we don't start it in unit tests, we explicitly start it here.
+	esController.eventBroadcaster.StartLogging(klog.Infof)
+	esController.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
 
 	esController.endpointsSynced = alwaysReady
 	esController.endpointSlicesSynced = alwaysReady
@@ -65,7 +72,7 @@ func newController(batchPeriod time.Duration) (*fake.Clientset, *endpointSliceMi
 	return client, &endpointSliceMirroringController{
 		esController,
 		informerFactory.Core().V1().Endpoints().Informer().GetStore(),
-		informerFactory.Discovery().V1beta1().EndpointSlices().Informer().GetStore(),
+		informerFactory.Discovery().V1().EndpointSlices().Informer().GetStore(),
 		informerFactory.Core().V1().Services().Informer().GetStore(),
 	}
 }
@@ -229,7 +236,7 @@ func TestSyncEndpoints(t *testing.T) {
 			for _, epSlice := range tc.endpointSlices {
 				epSlice.Namespace = namespace
 				esController.endpointSliceStore.Add(epSlice)
-				_, err := client.DiscoveryV1beta1().EndpointSlices(namespace).Create(context.TODO(), epSlice, metav1.CreateOptions{})
+				_, err := client.DiscoveryV1().EndpointSlices(namespace).Create(context.TODO(), epSlice, metav1.CreateOptions{})
 				if err != nil {
 					t.Fatalf("Expected no error creating EndpointSlice, got %v", err)
 				}

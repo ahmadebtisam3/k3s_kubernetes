@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -26,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	mock "k8s.io/apiserver/pkg/storage/value/encrypt/envelope/testing"
+	mock "k8s.io/apiserver/pkg/storage/value/encrypt/envelope/testing/v1beta1"
 
 	"k8s.io/apimachinery/pkg/util/uuid"
 )
@@ -185,12 +186,13 @@ func TestTimeouts(t *testing.T) {
 func TestIntermittentConnectionLoss(t *testing.T) {
 	t.Parallel()
 	var (
-		wg1      sync.WaitGroup
-		wg2      sync.WaitGroup
-		timeout  = 30 * time.Second
-		blackOut = 1 * time.Second
-		data     = []byte("test data")
-		endpoint = newEndpoint()
+		wg1        sync.WaitGroup
+		wg2        sync.WaitGroup
+		timeout    = 30 * time.Second
+		blackOut   = 1 * time.Second
+		data       = []byte("test data")
+		endpoint   = newEndpoint()
+		encryptErr error
 	)
 	// Start KMS Plugin
 	f, err := mock.NewBase64Plugin(endpoint.path)
@@ -228,7 +230,7 @@ func TestIntermittentConnectionLoss(t *testing.T) {
 		wg1.Done()
 		_, err := service.Encrypt(data)
 		if err != nil {
-			t.Fatalf("failed when executing encrypt, error: %v", err)
+			encryptErr = fmt.Errorf("failed when executing encrypt, error: %v", err)
 		}
 	}()
 
@@ -246,6 +248,10 @@ func TestIntermittentConnectionLoss(t *testing.T) {
 	t.Log("Restarted KMS Plugin")
 
 	wg2.Wait()
+
+	if encryptErr != nil {
+		t.Error(encryptErr)
+	}
 }
 
 func TestUnsupportedVersion(t *testing.T) {

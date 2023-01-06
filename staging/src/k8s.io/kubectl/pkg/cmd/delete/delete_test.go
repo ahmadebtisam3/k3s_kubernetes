@@ -290,7 +290,7 @@ func TestGracePeriodScenarios(t *testing.T) {
 			forceFlag:                 true,
 			expectedGracePeriod:       "0",
 			expectedOut:               "pod/foo\n",
-			expectedErrOut:            "warning: Immediate deletion does not wait for confirmation that the running resource has been terminated. The resource may continue to run on the cluster indefinitely.\n",
+			expectedErrOut:            "Warning: Immediate deletion does not wait for confirmation that the running resource has been terminated. The resource may continue to run on the cluster indefinitely.\n",
 			expectedDeleteRequestPath: "/namespaces/test/pods/foo",
 		},
 		{
@@ -300,7 +300,7 @@ func TestGracePeriodScenarios(t *testing.T) {
 			gracePeriodFlag:           "0",
 			expectedGracePeriod:       "0",
 			expectedOut:               "pod/foo\n",
-			expectedErrOut:            "warning: Immediate deletion does not wait for confirmation that the running resource has been terminated. The resource may continue to run on the cluster indefinitely.\n",
+			expectedErrOut:            "Warning: Immediate deletion does not wait for confirmation that the running resource has been terminated. The resource may continue to run on the cluster indefinitely.\n",
 			expectedDeleteRequestPath: "/namespaces/test/pods/foo",
 		},
 		{
@@ -794,13 +794,13 @@ func TestResourceErrors(t *testing.T) {
 		"resources but no selectors": {
 			args: []string{"pods"},
 			errFn: func(err error) bool {
-				return strings.Contains(err.Error(), "resource(s) were provided, but no name, label selector, or --all flag specified")
+				return strings.Contains(err.Error(), "resource(s) were provided, but no name was specified")
 			},
 		},
 		"multiple resources but no selectors": {
 			args: []string{"pods,deployments"},
 			errFn: func(err error) bool {
-				return strings.Contains(err.Error(), "resource(s) were provided, but no name, label selector, or --all flag specified")
+				return strings.Contains(err.Error(), "resource(s) were provided, but no name was specified")
 			},
 		},
 	}

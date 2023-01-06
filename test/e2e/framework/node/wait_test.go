@@ -31,7 +31,7 @@ import (
 // since single node checks are in TestReadyForTests.
 func TestCheckReadyForTests(t *testing.T) {
 	// This is a duplicate definition of the constant in pkg/controller/service/controller.go
-	labelNodeRoleMaster := "node-role.kubernetes.io/master"
+	labelNodeRoleControlPlane := "node-role.kubernetes.io/control-plane"
 
 	fromVanillaNode := func(f func(*v1.Node)) v1.Node {
 		vanillaNode := &v1.Node{
@@ -62,11 +62,11 @@ func TestCheckReadyForTests(t *testing.T) {
 			},
 			expected: true,
 		}, {
-			desc:              "Default value for nonblocking taints tolerates master taint",
-			nonblockingTaints: `node-role.kubernetes.io/master`,
+			desc:              "Default value for nonblocking taints tolerates control plane taint",
+			nonblockingTaints: `node-role.kubernetes.io/control-plane`,
 			nodes: []v1.Node{
 				fromVanillaNode(func(n *v1.Node) {
-					n.Spec.Taints = []v1.Taint{{Key: labelNodeRoleMaster, Effect: v1.TaintEffectNoSchedule}}
+					n.Spec.Taints = []v1.Taint{{Key: labelNodeRoleControlPlane, Effect: v1.TaintEffectNoSchedule}}
 				}),
 			},
 			expected: true,
@@ -168,15 +168,26 @@ func TestCheckReadyForTests(t *testing.T) {
 				return true, nodeList, tc.nodeListErr
 			})
 			checkFunc := CheckReadyForTests(c, tc.nonblockingTaints, tc.allowedNotReadyNodes, testLargeClusterThreshold)
-			out, err := checkFunc()
-			if out != tc.expected {
-				t.Errorf("Expected %v but got %v", tc.expected, out)
-			}
-			switch {
-			case err == nil && len(tc.expectedErr) > 0:
-				t.Errorf("Expected error %q nil", tc.expectedErr)
-			case err != nil && err.Error() != tc.expectedErr:
-				t.Errorf("Expected error %q but got %q", tc.expectedErr, err.Error())
+			// The check function returns "false, nil" during its
+			// first two calls, therefore we have to try several
+			// times until we get the expected error.
+			for attempt := 0; attempt <= 3; attempt++ {
+				out, err := checkFunc()
+				expected := tc.expected
+				expectedErr := tc.expectedErr
+				if tc.nodeListErr != nil && attempt < 2 {
+					expected = false
+					expectedErr = ""
+				}
+				if out != expected {
+					t.Errorf("Expected %v but got %v", expected, out)
+				}
+				switch {
+				case err == nil && expectedErr != "":
+					t.Errorf("attempt #%d: expected error %q nil", attempt, expectedErr)
+				case err != nil && err.Error() != expectedErr:
+					t.Errorf("attempt #%d: expected error %q but got %q", attempt, expectedErr, err.Error())
+				}
 			}
 		})
 	}

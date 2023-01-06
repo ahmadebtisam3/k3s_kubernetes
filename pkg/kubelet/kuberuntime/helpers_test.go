@@ -25,11 +25,77 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	runtimetesting "k8s.io/cri-api/pkg/apis/testing"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	utilpointer "k8s.io/utils/pointer"
 )
+
+func seccompLocalhostRef(profileName string) string {
+	return filepath.Join(fakeSeccompProfileRoot, profileName)
+}
+
+func seccompLocalhostPath(profileName string) string {
+	return "localhost/" + seccompLocalhostRef(profileName)
+}
+
+func TestIsInitContainerFailed(t *testing.T) {
+	tests := []struct {
+		status      *kubecontainer.Status
+		isFailed    bool
+		description string
+	}{
+		{
+			status: &kubecontainer.Status{
+				State:    kubecontainer.ContainerStateExited,
+				ExitCode: 1,
+			},
+			isFailed:    true,
+			description: "Init container in exited state and non-zero exit code should return true",
+		},
+		{
+			status: &kubecontainer.Status{
+				State: kubecontainer.ContainerStateUnknown,
+			},
+			isFailed:    true,
+			description: "Init container in unknown state should return true",
+		},
+		{
+			status: &kubecontainer.Status{
+				Reason:   "OOMKilled",
+				ExitCode: 0,
+			},
+			isFailed:    true,
+			description: "Init container which reason is OOMKilled should return true",
+		},
+		{
+			status: &kubecontainer.Status{
+				State:    kubecontainer.ContainerStateExited,
+				ExitCode: 0,
+			},
+			isFailed:    false,
+			description: "Init container in exited state and zero exit code should return false",
+		},
+		{
+			status: &kubecontainer.Status{
+				State: kubecontainer.ContainerStateRunning,
+			},
+			isFailed:    false,
+			description: "Init container in running state should return false",
+		},
+		{
+			status: &kubecontainer.Status{
+				State: kubecontainer.ContainerStateCreated,
+			},
+			isFailed:    false,
+			description: "Init container in created state should return false",
+		},
+	}
+	for i, test := range tests {
+		isFailed := isInitContainerFailed(test.status)
+		assert.Equal(t, test.isFailed, isFailed, "TestCase[%d]: %s", i, test.description)
+	}
+}
 
 func TestStableKey(t *testing.T) {
 	container := &v1.Container{
@@ -210,7 +276,7 @@ func TestFieldProfile(t *testing.T) {
 			expectedProfile: "unconfined",
 		},
 		{
-			description: "SeccompProfileTypeLocalhost should return unconfined",
+			description: "SeccompProfileTypeLocalhost should return localhost",
 			scmpProfile: &v1.SeccompProfile{
 				Type:             v1.SeccompProfileTypeLocalhost,
 				LocalhostProfile: utilpointer.StringPtr("profile.json"),
@@ -221,7 +287,63 @@ func TestFieldProfile(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		seccompProfile := fieldProfile(test.scmpProfile, test.rootPath)
+		seccompProfile := fieldProfile(test.scmpProfile, test.rootPath, false)
+		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]: %s", i, test.description)
+	}
+}
+
+func TestFieldProfileDefaultSeccomp(t *testing.T) {
+	tests := []struct {
+		description     string
+		scmpProfile     *v1.SeccompProfile
+		rootPath        string
+		expectedProfile string
+	}{
+		{
+			description:     "no seccompProfile should return runtime/default",
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
+		},
+		{
+			description: "type localhost without profile should return runtime/default",
+			scmpProfile: &v1.SeccompProfile{
+				Type: v1.SeccompProfileTypeLocalhost,
+			},
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
+		},
+		{
+			description: "unknown type should return runtime/default",
+			scmpProfile: &v1.SeccompProfile{
+				Type: "",
+			},
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
+		},
+		{
+			description: "SeccompProfileTypeRuntimeDefault should return runtime/default",
+			scmpProfile: &v1.SeccompProfile{
+				Type: v1.SeccompProfileTypeRuntimeDefault,
+			},
+			expectedProfile: "runtime/default",
+		},
+		{
+			description: "SeccompProfileTypeUnconfined should return unconfined",
+			scmpProfile: &v1.SeccompProfile{
+				Type: v1.SeccompProfileTypeUnconfined,
+			},
+			expectedProfile: "unconfined",
+		},
+		{
+			description: "SeccompProfileTypeLocalhost should return localhost",
+			scmpProfile: &v1.SeccompProfile{
+				Type:             v1.SeccompProfileTypeLocalhost,
+				LocalhostProfile: utilpointer.StringPtr("profile.json"),
+			},
+			rootPath:        "/test/",
+			expectedProfile: "localhost//test/profile.json",
+		},
+	}
+
+	for i, test := range tests {
+		seccompProfile := fieldProfile(test.scmpProfile, test.rootPath, true)
 		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]: %s", i, test.description)
 	}
 }
@@ -248,89 +370,79 @@ func TestGetSeccompProfilePath(t *testing.T) {
 			expectedProfile: "",
 		},
 		{
-			description: "annotations: pod runtime/default seccomp profile should return runtime/default",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: v1.SeccompProfileRuntimeDefault,
-			},
-			expectedProfile: "runtime/default",
-		},
-		{
-			description: "annotations: pod docker/default seccomp profile should return docker/default",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: v1.DeprecatedSeccompProfileDockerDefault,
-			},
-			expectedProfile: "docker/default",
-		},
-		{
-			description: "annotations: pod runtime/default seccomp profile with containerName should return runtime/default",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: v1.SeccompProfileRuntimeDefault,
-			},
-			containerName:   "container1",
-			expectedProfile: "runtime/default",
-		},
-		{
-			description: "annotations: pod docker/default seccomp profile with containerName should return docker/default",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: v1.DeprecatedSeccompProfileDockerDefault,
-			},
-			containerName:   "container1",
-			expectedProfile: "docker/default",
-		},
-		{
-			description: "annotations: pod unconfined seccomp profile should return unconfined",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: v1.SeccompProfileNameUnconfined,
-			},
+			description:     "pod seccomp profile set to unconfined returns unconfined",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeUnconfined}},
 			expectedProfile: "unconfined",
 		},
 		{
-			description: "annotations: pod unconfined seccomp profile with containerName should return unconfined",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: v1.SeccompProfileNameUnconfined,
-			},
-			containerName:   "container1",
+			description:     "container seccomp profile set to unconfined returns unconfined",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeUnconfined}},
 			expectedProfile: "unconfined",
 		},
 		{
-			description: "annotations: pod localhost seccomp profile should return local profile path",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "localhost/chmod.json",
-			},
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
+			description:     "pod seccomp profile set to SeccompProfileTypeRuntimeDefault returns runtime/default",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
+			expectedProfile: "runtime/default",
 		},
 		{
-			description: "annotations: pod localhost seccomp profile with containerName should return local profile path",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "localhost/chmod.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
+			description:     "container seccomp profile set to SeccompProfileTypeRuntimeDefault returns runtime/default",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
+			expectedProfile: "runtime/default",
 		},
 		{
-			description: "annotations: container localhost seccomp profile with containerName should return local profile path",
-			annotation: map[string]string{
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/chmod.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
+			description:     "pod seccomp profile set to SeccompProfileTypeLocalhost returns 'localhost/' + LocalhostProfile",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename")}},
+			expectedProfile: seccompLocalhostPath("filename"),
 		},
 		{
-			description: "annotations: container localhost seccomp profile should override pod profile",
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey:                            v1.SeccompProfileNameUnconfined,
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/chmod.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "chmod.json"),
-		},
-		{
-			description: "annotations: container localhost seccomp profile with unmatched containerName should return empty",
-			annotation: map[string]string{
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/chmod.json",
-			},
-			containerName:   "container2",
+			description:     "pod seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns empty",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost}},
 			expectedProfile: "",
+		},
+		{
+			description:     "container seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns empty",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost}},
+			expectedProfile: "",
+		},
+		{
+			description:     "container seccomp profile set to SeccompProfileTypeLocalhost returns 'localhost/' + LocalhostProfile",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename2")}},
+			expectedProfile: seccompLocalhostPath("filename2"),
+		},
+		{
+			description:     "prioritise container field over pod field",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeUnconfined}},
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
+			expectedProfile: "runtime/default",
+		},
+	}
+
+	for i, test := range tests {
+		seccompProfile := m.getSeccompProfilePath(test.annotation, test.containerName, test.podSc, test.containerSc, false)
+		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]: %s", i, test.description)
+	}
+}
+
+func TestGetSeccompProfilePathDefaultSeccomp(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	require.NoError(t, err)
+
+	tests := []struct {
+		description     string
+		annotation      map[string]string
+		podSc           *v1.PodSecurityContext
+		containerSc     *v1.SecurityContext
+		containerName   string
+		expectedProfile string
+	}{
+		{
+			description:     "no seccomp should return runtime/default",
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
+		},
+		{
+			description:     "annotations: no seccomp with containerName should return runtime/default",
+			containerName:   "container1",
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
 		},
 		{
 			description:     "pod seccomp profile set to unconfined returns unconfined",
@@ -355,22 +467,22 @@ func TestGetSeccompProfilePath(t *testing.T) {
 		{
 			description:     "pod seccomp profile set to SeccompProfileTypeLocalhost returns 'localhost/' + LocalhostProfile",
 			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename")}},
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "filename"),
+			expectedProfile: seccompLocalhostPath("filename"),
 		},
 		{
-			description:     "pod seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns empty",
+			description:     "pod seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns runtime/default",
 			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost}},
-			expectedProfile: "",
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
 		},
 		{
-			description:     "container seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns empty",
+			description:     "container seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns runtime/default",
 			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost}},
-			expectedProfile: "",
+			expectedProfile: v1.SeccompProfileRuntimeDefault,
 		},
 		{
 			description:     "container seccomp profile set to SeccompProfileTypeLocalhost returns 'localhost/' + LocalhostProfile",
 			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename2")}},
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "filename2"),
+			expectedProfile: seccompLocalhostPath("filename2"),
 		},
 		{
 			description:     "prioritise container field over pod field",
@@ -378,40 +490,10 @@ func TestGetSeccompProfilePath(t *testing.T) {
 			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
 			expectedProfile: "runtime/default",
 		},
-		{
-			description: "prioritise container field over container annotation, pod field and pod annotation",
-			podSc:       &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("field-pod-profile.json")}},
-			containerSc: &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("field-cont-profile.json")}},
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey:                            "localhost/annota-pod-profile.json",
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/annota-cont-profile.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "field-cont-profile.json"),
-		},
-		{
-			description: "prioritise container annotation over pod field",
-			podSc:       &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("field-pod-profile.json")}},
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey:                            "localhost/annota-pod-profile.json",
-				v1.SeccompContainerAnnotationKeyPrefix + "container1": "localhost/annota-cont-profile.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "annota-cont-profile.json"),
-		},
-		{
-			description: "prioritise pod field over pod annotation",
-			podSc:       &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("field-pod-profile.json")}},
-			annotation: map[string]string{
-				v1.SeccompPodAnnotationKey: "localhost/annota-pod-profile.json",
-			},
-			containerName:   "container1",
-			expectedProfile: "localhost/" + filepath.Join(fakeSeccompProfileRoot, "field-pod-profile.json"),
-		},
 	}
 
 	for i, test := range tests {
-		seccompProfile := m.getSeccompProfilePath(test.annotation, test.containerName, test.podSc, test.containerSc)
+		seccompProfile := m.getSeccompProfilePath(test.annotation, test.containerName, test.podSc, test.containerSc, true)
 		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]: %s", i, test.description)
 	}
 }
@@ -465,7 +547,7 @@ func TestGetSeccompProfile(t *testing.T) {
 			podSc:       &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename")}},
 			expectedProfile: &runtimeapi.SecurityProfile{
 				ProfileType:  runtimeapi.SecurityProfile_Localhost,
-				LocalhostRef: filepath.Join(fakeSeccompProfileRoot, "filename"),
+				LocalhostRef: seccompLocalhostRef("filename"),
 			},
 		},
 		{
@@ -483,7 +565,7 @@ func TestGetSeccompProfile(t *testing.T) {
 			containerSc: &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename2")}},
 			expectedProfile: &runtimeapi.SecurityProfile{
 				ProfileType:  runtimeapi.SecurityProfile_Localhost,
-				LocalhostRef: filepath.Join(fakeSeccompProfileRoot, "filename2"),
+				LocalhostRef: seccompLocalhostRef("filename2"),
 			},
 		},
 		{
@@ -499,83 +581,111 @@ func TestGetSeccompProfile(t *testing.T) {
 			containerName: "container1",
 			expectedProfile: &runtimeapi.SecurityProfile{
 				ProfileType:  runtimeapi.SecurityProfile_Localhost,
-				LocalhostRef: filepath.Join(fakeSeccompProfileRoot, "field-cont-profile.json"),
+				LocalhostRef: seccompLocalhostRef("field-cont-profile.json"),
 			},
 		},
 	}
 
 	for i, test := range tests {
-		seccompProfile := m.getSeccompProfile(test.annotation, test.containerName, test.podSc, test.containerSc)
+		seccompProfile := m.getSeccompProfile(test.annotation, test.containerName, test.podSc, test.containerSc, false)
+		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]: %s", i, test.description)
+	}
+}
+
+func TestGetSeccompProfileDefaultSeccomp(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	require.NoError(t, err)
+
+	unconfinedProfile := &runtimeapi.SecurityProfile{
+		ProfileType: runtimeapi.SecurityProfile_Unconfined,
+	}
+
+	runtimeDefaultProfile := &runtimeapi.SecurityProfile{
+		ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
+	}
+
+	tests := []struct {
+		description     string
+		annotation      map[string]string
+		podSc           *v1.PodSecurityContext
+		containerSc     *v1.SecurityContext
+		containerName   string
+		expectedProfile *runtimeapi.SecurityProfile
+	}{
+		{
+			description:     "no seccomp should return RuntimeDefault",
+			expectedProfile: runtimeDefaultProfile,
+		},
+		{
+			description:     "pod seccomp profile set to unconfined returns unconfined",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeUnconfined}},
+			expectedProfile: unconfinedProfile,
+		},
+		{
+			description:     "container seccomp profile set to unconfined returns unconfined",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeUnconfined}},
+			expectedProfile: unconfinedProfile,
+		},
+		{
+			description:     "pod seccomp profile set to SeccompProfileTypeRuntimeDefault returns runtime/default",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
+			expectedProfile: runtimeDefaultProfile,
+		},
+		{
+			description:     "container seccomp profile set to SeccompProfileTypeRuntimeDefault returns runtime/default",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
+			expectedProfile: runtimeDefaultProfile,
+		},
+		{
+			description: "pod seccomp profile set to SeccompProfileTypeLocalhost returns 'localhost/' + LocalhostProfile",
+			podSc:       &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename")}},
+			expectedProfile: &runtimeapi.SecurityProfile{
+				ProfileType:  runtimeapi.SecurityProfile_Localhost,
+				LocalhostRef: seccompLocalhostRef("filename"),
+			},
+		},
+		{
+			description:     "pod seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns unconfined",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost}},
+			expectedProfile: unconfinedProfile,
+		},
+		{
+			description:     "container seccomp profile set to SeccompProfileTypeLocalhost with empty LocalhostProfile returns unconfined",
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost}},
+			expectedProfile: unconfinedProfile,
+		},
+		{
+			description: "container seccomp profile set to SeccompProfileTypeLocalhost returns 'localhost/' + LocalhostProfile",
+			containerSc: &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("filename2")}},
+			expectedProfile: &runtimeapi.SecurityProfile{
+				ProfileType:  runtimeapi.SecurityProfile_Localhost,
+				LocalhostRef: seccompLocalhostRef("filename2"),
+			},
+		},
+		{
+			description:     "prioritise container field over pod field",
+			podSc:           &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeUnconfined}},
+			containerSc:     &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeRuntimeDefault}},
+			expectedProfile: runtimeDefaultProfile,
+		},
+		{
+			description:   "prioritise container field over pod field",
+			podSc:         &v1.PodSecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("field-pod-profile.json")}},
+			containerSc:   &v1.SecurityContext{SeccompProfile: &v1.SeccompProfile{Type: v1.SeccompProfileTypeLocalhost, LocalhostProfile: getLocal("field-cont-profile.json")}},
+			containerName: "container1",
+			expectedProfile: &runtimeapi.SecurityProfile{
+				ProfileType:  runtimeapi.SecurityProfile_Localhost,
+				LocalhostRef: seccompLocalhostRef("field-cont-profile.json"),
+			},
+		},
+	}
+
+	for i, test := range tests {
+		seccompProfile := m.getSeccompProfile(test.annotation, test.containerName, test.podSc, test.containerSc, true)
 		assert.Equal(t, test.expectedProfile, seccompProfile, "TestCase[%d]: %s", i, test.description)
 	}
 }
 
 func getLocal(v string) *string {
 	return &v
-}
-
-func TestNamespacesForPod(t *testing.T) {
-	for desc, test := range map[string]struct {
-		input    *v1.Pod
-		expected *runtimeapi.NamespaceOption
-	}{
-		"nil pod -> default v1 namespaces": {
-			nil,
-			&runtimeapi.NamespaceOption{
-				Ipc:     runtimeapi.NamespaceMode_POD,
-				Network: runtimeapi.NamespaceMode_POD,
-				Pid:     runtimeapi.NamespaceMode_CONTAINER,
-			},
-		},
-		"v1.Pod default namespaces": {
-			&v1.Pod{},
-			&runtimeapi.NamespaceOption{
-				Ipc:     runtimeapi.NamespaceMode_POD,
-				Network: runtimeapi.NamespaceMode_POD,
-				Pid:     runtimeapi.NamespaceMode_CONTAINER,
-			},
-		},
-		"Host Namespaces": {
-			&v1.Pod{
-				Spec: v1.PodSpec{
-					HostIPC:     true,
-					HostNetwork: true,
-					HostPID:     true,
-				},
-			},
-			&runtimeapi.NamespaceOption{
-				Ipc:     runtimeapi.NamespaceMode_NODE,
-				Network: runtimeapi.NamespaceMode_NODE,
-				Pid:     runtimeapi.NamespaceMode_NODE,
-			},
-		},
-		"Shared Process Namespace (feature enabled)": {
-			&v1.Pod{
-				Spec: v1.PodSpec{
-					ShareProcessNamespace: &[]bool{true}[0],
-				},
-			},
-			&runtimeapi.NamespaceOption{
-				Ipc:     runtimeapi.NamespaceMode_POD,
-				Network: runtimeapi.NamespaceMode_POD,
-				Pid:     runtimeapi.NamespaceMode_POD,
-			},
-		},
-		"Shared Process Namespace, redundant flag (feature enabled)": {
-			&v1.Pod{
-				Spec: v1.PodSpec{
-					ShareProcessNamespace: &[]bool{false}[0],
-				},
-			},
-			&runtimeapi.NamespaceOption{
-				Ipc:     runtimeapi.NamespaceMode_POD,
-				Network: runtimeapi.NamespaceMode_POD,
-				Pid:     runtimeapi.NamespaceMode_CONTAINER,
-			},
-		},
-	} {
-		t.Logf("TestCase: %s", desc)
-		actual := namespacesForPod(test.input)
-		assert.Equal(t, test.expected, actual)
-	}
 }

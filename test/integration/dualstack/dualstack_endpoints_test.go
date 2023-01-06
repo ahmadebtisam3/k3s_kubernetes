@@ -19,58 +19,41 @@ package dualstack
 import (
 	"context"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
-	clientset "k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/pkg/controller/endpoint"
 	"k8s.io/kubernetes/pkg/controller/endpointslice"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
 func TestDualStackEndpoints(t *testing.T) {
 	// Create an IPv4IPv6 dual stack control-plane
 	serviceCIDR := "10.0.0.0/16"
-	secondaryServiceCIDR := "2001:db8:1::/48"
+	secondaryServiceCIDR := "2001:db8:1::/112"
 	labelMap := func() map[string]string {
 		return map[string]string{"foo": "bar"}
 	}
 
-	dualStack := true
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, dualStack)()
-
-	cfg := framework.NewIntegrationTestMasterConfig()
-	_, cidr, err := net.ParseCIDR(serviceCIDR)
-	if err != nil {
-		t.Fatalf("Bad cidr: %v", err)
-	}
-	cfg.ExtraConfig.ServiceIPRange = *cidr
-
-	_, secCidr, err := net.ParseCIDR(secondaryServiceCIDR)
-	if err != nil {
-		t.Fatalf("Bad cidr: %v", err)
-	}
-	cfg.ExtraConfig.SecondaryServiceIPRange = *secCidr
-
-	_, s, closeFn := framework.RunAMaster(cfg)
-	defer closeFn()
-
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL})
+	client, _, tearDownFn := framework.StartTestServer(t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			opts.ServiceClusterIPRanges = fmt.Sprintf("%s,%s", serviceCIDR, secondaryServiceCIDR)
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+		},
+	})
+	defer tearDownFn()
 
 	// Wait until the default "kubernetes" service is created.
-	if err = wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
+	if err := wait.Poll(250*time.Millisecond, time.Minute, func() (bool, error) {
 		_, err := client.CoreV1().Services(metav1.NamespaceDefault).Get(context.TODO(), "kubernetes", metav1.GetOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
@@ -115,24 +98,24 @@ func TestDualStackEndpoints(t *testing.T) {
 		informers.Core().V1().Pods(),
 		informers.Core().V1().Services(),
 		informers.Core().V1().Nodes(),
-		informers.Discovery().V1beta1().EndpointSlices(),
+		informers.Discovery().V1().EndpointSlices(),
 		int32(100),
 		client,
 		1*time.Second)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// Start informer and controllers
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	informers.Start(stopCh)
+	informers.Start(ctx.Done())
 	// use only one worker to serialize the updates
-	go epController.Run(1, stopCh)
-	go epsController.Run(1, stopCh)
+	go epController.Run(ctx, 1)
+	go epsController.Run(1, ctx.Done())
 
 	var testcases = []struct {
 		name           string
 		serviceType    v1.ServiceType
 		ipFamilies     []v1.IPFamily
-		ipFamilyPolicy v1.IPFamilyPolicyType
+		ipFamilyPolicy v1.IPFamilyPolicy
 	}{
 		{
 			name:           "Service IPv4 Only",
@@ -162,8 +145,8 @@ func TestDualStackEndpoints(t *testing.T) {
 
 	for i, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			ns := framework.CreateTestingNamespace(fmt.Sprintf("test-endpointslice-dualstack-%d", i), s, t)
-			defer framework.DeleteTestingNamespace(ns, s, t)
+			ns := framework.CreateNamespaceOrDie(client, fmt.Sprintf("test-endpointslice-dualstack-%d", i), t)
+			defer framework.DeleteNamespaceOrDie(client, ns, t)
 
 			// Create a pod with labels
 			pod := &v1.Pod{
@@ -253,7 +236,7 @@ func TestDualStackEndpoints(t *testing.T) {
 			// wait until the endpoint slices are created
 			err = wait.PollImmediate(1*time.Second, wait.ForeverTestTimeout, func() (bool, error) {
 				lSelector := discovery.LabelServiceName + "=" + svc.Name
-				esList, err := client.DiscoveryV1beta1().EndpointSlices(ns.Name).List(context.TODO(), metav1.ListOptions{LabelSelector: lSelector})
+				esList, err := client.DiscoveryV1().EndpointSlices(ns.Name).List(context.TODO(), metav1.ListOptions{LabelSelector: lSelector})
 				if err != nil {
 					t.Logf("Error listing EndpointSlices: %v", err)
 					return false, nil

@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -74,8 +75,7 @@ func (plugin *vsphereVolumePlugin) GetPluginName() string {
 }
 
 func (plugin *vsphereVolumePlugin) IsMigratedToCSI() bool {
-	return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) &&
-		utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationvSphere)
+	return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationvSphere)
 }
 
 func (plugin *vsphereVolumePlugin) GetVolumeName(spec *volume.Spec) (string, error) {
@@ -102,6 +102,10 @@ func (plugin *vsphereVolumePlugin) SupportsMountOption() bool {
 
 func (plugin *vsphereVolumePlugin) SupportsBulkVolumeVerification() bool {
 	return true
+}
+
+func (plugin *vsphereVolumePlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
 func (plugin *vsphereVolumePlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, _ volume.VolumeOptions) (volume.Mounter, error) {
@@ -207,21 +211,14 @@ type vsphereVolumeMounter struct {
 
 func (b *vsphereVolumeMounter) GetAttributes() volume.Attributes {
 	return volume.Attributes{
-		SupportsSELinux: true,
-		Managed:         true,
+		SELinuxRelabel: true,
+		Managed:        true,
 	}
 }
 
 // SetUp attaches the disk and bind mounts to the volume path.
 func (b *vsphereVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
 	return b.SetUpAt(b.GetPath(), mounterArgs)
-}
-
-// Checks prior to mount operations to verify that the required components (binaries, etc.)
-// to mount the volume are available on the underlying node.
-// If not, it returns an error
-func (b *vsphereVolumeMounter) CanMount() error {
-	return nil
 }
 
 // SetUp attaches the disk and bind mounts to the volume path.
@@ -369,7 +366,7 @@ func (plugin *vsphereVolumePlugin) newProvisionerInternal(options volume.VolumeO
 }
 
 func (v *vsphereVolumeProvisioner) Provision(selectedNode *v1.Node, allowedTopologies []v1.TopologySelectorTerm) (*v1.PersistentVolume, error) {
-	if !util.AccessModesContainedInAll(v.plugin.GetAccessModes(), v.options.PVC.Spec.AccessModes) {
+	if !util.ContainsAllAccessModes(v.plugin.GetAccessModes(), v.options.PVC.Spec.AccessModes) {
 		return nil, fmt.Errorf("invalid AccessModes %v: only AccessModes %v are supported", v.options.PVC.Spec.AccessModes, v.plugin.GetAccessModes())
 	}
 	klog.V(1).Infof("Provision with selectedNode: %s and allowedTopologies : %s", getNodeName(selectedNode), allowedTopologies)
@@ -433,7 +430,7 @@ func (v *vsphereVolumeProvisioner) Provision(selectedNode *v1.Node, allowedTopol
 		for k, v := range labels {
 			pv.Labels[k] = v
 			var values []string
-			if k == v1.LabelFailureDomainBetaZone {
+			if k == v1.LabelTopologyZone || k == v1.LabelFailureDomainBetaZone {
 				values, err = volumehelpers.LabelZonesToList(v)
 				if err != nil {
 					return nil, fmt.Errorf("failed to convert label string for Zone: %s to a List: %v", v, err)

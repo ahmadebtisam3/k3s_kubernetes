@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	critest "k8s.io/cri-api/pkg/apis/testing"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
@@ -138,8 +139,11 @@ func TestCRIListPodStats(t *testing.T) {
 		podLogStats1 = makeFakeLogStats(6000)
 	)
 
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
 	var (
-		mockCadvisor       = new(cadvisortest.Mock)
+		mockCadvisor       = cadvisortest.NewMockInterface(mockCtrl)
 		mockRuntimeCache   = new(kubecontainertest.MockRuntimeCache)
 		mockPodManager     = new(kubepodtest.MockManager)
 		resourceAnalyzer   = new(fakeResourceAnalyzer)
@@ -170,11 +174,11 @@ func TestCRIListPodStats(t *testing.T) {
 		Recursive: true,
 	}
 
-	mockCadvisor.
-		On("ContainerInfoV2", "/", options).Return(infos, nil).
-		On("RootFsInfo").Return(rootFsInfo, nil).
-		On("GetDirFsInfo", imageFsMountpoint).Return(imageFsInfo, nil).
-		On("GetDirFsInfo", unknownMountpoint).Return(cadvisorapiv2.FsInfo{}, cadvisorfs.ErrNoSuchDevice)
+	mockCadvisor.EXPECT().ContainerInfoV2("/", options).Return(infos, nil)
+	mockCadvisor.EXPECT().RootFsInfo().Return(rootFsInfo, nil)
+	mockCadvisor.EXPECT().GetDirFsInfo(imageFsMountpoint).Return(imageFsInfo, nil)
+	mockCadvisor.EXPECT().GetDirFsInfo(unknownMountpoint).Return(cadvisorapiv2.FsInfo{}, cadvisorfs.ErrNoSuchDevice)
+
 	fakeRuntimeService.SetFakeSandboxes([]*critest.FakePodSandbox{
 		sandbox0, sandbox1, sandbox2, sandbox3, sandbox4, sandbox5,
 	})
@@ -192,7 +196,7 @@ func TestCRIListPodStats(t *testing.T) {
 		PersistentVolumes: persistentVolumes,
 	}
 
-	fakeLogStats := map[string]*volume.Metrics{
+	fakeStats := map[string]*volume.Metrics{
 		kuberuntime.BuildContainerLogsDirectory("sandbox0-ns", "sandbox0-name", types.UID("sandbox0-uid"), cName0):               containerLogStats0,
 		kuberuntime.BuildContainerLogsDirectory("sandbox0-ns", "sandbox0-name", types.UID("sandbox0-uid"), cName1):               containerLogStats1,
 		kuberuntime.BuildContainerLogsDirectory("sandbox1-ns", "sandbox1-name", types.UID("sandbox1-uid"), cName2):               containerLogStats2,
@@ -202,7 +206,6 @@ func TestCRIListPodStats(t *testing.T) {
 		filepath.Join(kuberuntime.BuildPodLogsDirectory("sandbox0-ns", "sandbox0-name", types.UID("sandbox0-uid")), podLogName0): podLogStats0,
 		filepath.Join(kuberuntime.BuildPodLogsDirectory("sandbox1-ns", "sandbox1-name", types.UID("sandbox1-uid")), podLogName1): podLogStats1,
 	}
-	fakeLogStatsProvider := NewFakeLogMetricsService(fakeLogStats)
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -231,8 +234,8 @@ func TestCRIListPodStats(t *testing.T) {
 		mockRuntimeCache,
 		fakeRuntimeService,
 		fakeImageService,
-		fakeLogStatsProvider,
-		fakeOS,
+		NewFakeHostStatsProviderWithData(fakeStats, fakeOS),
+		false,
 	)
 
 	stats, err := provider.ListPodStats()
@@ -260,11 +263,14 @@ func TestCRIListPodStats(t *testing.T) {
 	c0 := containerStatsMap[cName0]
 	assert.Equal(container0.CreatedAt, c0.StartTime.UnixNano())
 	checkCRICPUAndMemoryStats(assert, c0, infos[container0.ContainerStatus.Id].Stats[0])
+	assert.Nil(c0.Accelerators)
 	checkCRIRootfsStats(assert, c0, containerStats0, &imageFsInfo)
 	checkCRILogsStats(assert, c0, &rootFsInfo, containerLogStats0)
+
 	c1 := containerStatsMap[cName1]
 	assert.Equal(container1.CreatedAt, c1.StartTime.UnixNano())
 	checkCRICPUAndMemoryStats(assert, c1, infos[container1.ContainerStatus.Id].Stats[0])
+	assert.Nil(c0.Accelerators)
 	checkCRIRootfsStats(assert, c1, containerStats1, nil)
 	checkCRILogsStats(assert, c1, &rootFsInfo, containerLogStats1)
 	checkCRINetworkStats(assert, p0.Network, infos[sandbox0.PodSandboxStatus.Id].Stats[0].Network)
@@ -280,6 +286,7 @@ func TestCRIListPodStats(t *testing.T) {
 	assert.Equal(cName2, c2.Name)
 	assert.Equal(container2.CreatedAt, c2.StartTime.UnixNano())
 	checkCRICPUAndMemoryStats(assert, c2, infos[container2.ContainerStatus.Id].Stats[0])
+	assert.Nil(c0.Accelerators)
 	checkCRIRootfsStats(assert, c2, containerStats2, &imageFsInfo)
 	checkCRILogsStats(assert, c2, &rootFsInfo, containerLogStats2)
 	checkCRINetworkStats(assert, p1.Network, infos[sandbox1.PodSandboxStatus.Id].Stats[0].Network)
@@ -296,6 +303,7 @@ func TestCRIListPodStats(t *testing.T) {
 	assert.Equal(cName3, c3.Name)
 	assert.Equal(container4.CreatedAt, c3.StartTime.UnixNano())
 	checkCRICPUAndMemoryStats(assert, c3, infos[container4.ContainerStatus.Id].Stats[0])
+	assert.Nil(c0.Accelerators)
 	checkCRIRootfsStats(assert, c3, containerStats4, &imageFsInfo)
 
 	checkCRILogsStats(assert, c3, &rootFsInfo, containerLogStats4)
@@ -312,8 +320,6 @@ func TestCRIListPodStats(t *testing.T) {
 	assert.NotNil(c8.CPU.Time)
 	assert.NotNil(c8.Memory.Time)
 	checkCRIPodCPUAndMemoryStats(assert, p3, infos[sandbox3Cgroup].Stats[0])
-
-	mockCadvisor.AssertExpectations(t)
 }
 
 func TestCRIListPodCPUAndMemoryStats(t *testing.T) {
@@ -365,8 +371,11 @@ func TestCRIListPodCPUAndMemoryStats(t *testing.T) {
 		containerStats9 = makeFakeContainerStats(container9, imageFsMountpoint)
 	)
 
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
 	var (
-		mockCadvisor       = new(cadvisortest.Mock)
+		mockCadvisor       = cadvisortest.NewMockInterface(mockCtrl)
 		mockRuntimeCache   = new(kubecontainertest.MockRuntimeCache)
 		mockPodManager     = new(kubepodtest.MockManager)
 		resourceAnalyzer   = new(fakeResourceAnalyzer)
@@ -396,8 +405,8 @@ func TestCRIListPodCPUAndMemoryStats(t *testing.T) {
 		Recursive: true,
 	}
 
-	mockCadvisor.
-		On("ContainerInfoV2", "/", options).Return(infos, nil)
+	mockCadvisor.EXPECT().ContainerInfoV2("/", options).Return(infos, nil)
+
 	fakeRuntimeService.SetFakeSandboxes([]*critest.FakePodSandbox{
 		sandbox0, sandbox1, sandbox2, sandbox3, sandbox4, sandbox5, sandbox6,
 	})
@@ -422,8 +431,8 @@ func TestCRIListPodCPUAndMemoryStats(t *testing.T) {
 		mockRuntimeCache,
 		fakeRuntimeService,
 		nil,
-		nil,
-		&kubecontainertest.FakeOS{},
+		NewFakeHostStatsProvider(),
+		false,
 	)
 
 	stats, err := provider.ListPodCPUAndMemoryStats()
@@ -520,8 +529,6 @@ func TestCRIListPodCPUAndMemoryStats(t *testing.T) {
 	assert.Equal(containerStats9.Cpu.Timestamp, p6.CPU.Time.UnixNano())
 	assert.NotNil(c9.Memory.Time)
 	assert.Equal(containerStats9.Memory.Timestamp, p6.Memory.Time.UnixNano())
-
-	mockCadvisor.AssertExpectations(t)
 }
 
 func TestCRIImagesFsStats(t *testing.T) {
@@ -530,17 +537,19 @@ func TestCRIImagesFsStats(t *testing.T) {
 		imageFsInfo       = getTestFsInfo(2000)
 		imageFsUsage      = makeFakeImageFsUsage(imageFsMountpoint)
 	)
-	var (
-		mockCadvisor         = new(cadvisortest.Mock)
-		mockRuntimeCache     = new(kubecontainertest.MockRuntimeCache)
-		mockPodManager       = new(kubepodtest.MockManager)
-		resourceAnalyzer     = new(fakeResourceAnalyzer)
-		fakeRuntimeService   = critest.NewFakeRuntimeService()
-		fakeImageService     = critest.NewFakeImageService()
-		fakeLogStatsProvider = NewFakeLogMetricsService(nil)
-	)
 
-	mockCadvisor.On("GetDirFsInfo", imageFsMountpoint).Return(imageFsInfo, nil)
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	var (
+		mockCadvisor       = cadvisortest.NewMockInterface(mockCtrl)
+		mockRuntimeCache   = new(kubecontainertest.MockRuntimeCache)
+		mockPodManager     = new(kubepodtest.MockManager)
+		resourceAnalyzer   = new(fakeResourceAnalyzer)
+		fakeRuntimeService = critest.NewFakeRuntimeService()
+		fakeImageService   = critest.NewFakeImageService()
+	)
+	mockCadvisor.EXPECT().GetDirFsInfo(imageFsMountpoint).Return(imageFsInfo, nil)
 	fakeImageService.SetFakeFilesystemUsage([]*runtimeapi.FilesystemUsage{
 		imageFsUsage,
 	})
@@ -552,8 +561,8 @@ func TestCRIImagesFsStats(t *testing.T) {
 		mockRuntimeCache,
 		fakeRuntimeService,
 		fakeImageService,
-		fakeLogStatsProvider,
-		&kubecontainertest.FakeOS{},
+		NewFakeHostStatsProvider(),
+		false,
 	)
 
 	stats, err := provider.ImageFsStats()
@@ -567,8 +576,6 @@ func TestCRIImagesFsStats(t *testing.T) {
 	assert.Equal(imageFsInfo.Inodes, stats.Inodes)
 	assert.Equal(imageFsUsage.UsedBytes.Value, *stats.UsedBytes)
 	assert.Equal(imageFsUsage.InodesUsed.Value, *stats.InodesUsed)
-
-	mockCadvisor.AssertExpectations(t)
 }
 
 func makeFakePodSandbox(name, uid, namespace string, terminated bool) *critest.FakePodSandbox {
@@ -586,7 +593,7 @@ func makeFakePodSandbox(name, uid, namespace string, terminated bool) *critest.F
 	if terminated {
 		p.PodSandboxStatus.State = runtimeapi.PodSandboxState_SANDBOX_NOTREADY
 	}
-	p.PodSandboxStatus.Id = string(uuid.NewUUID())
+	p.PodSandboxStatus.Id = strings.ReplaceAll(string(uuid.NewUUID()), "-", "")
 	return p
 }
 
@@ -612,7 +619,7 @@ func makeFakeContainer(sandbox *critest.FakePodSandbox, name string, attempt uin
 	} else {
 		c.ContainerStatus.State = runtimeapi.ContainerState_CONTAINER_RUNNING
 	}
-	c.ContainerStatus.Id = string(uuid.NewUUID())
+	c.ContainerStatus.Id = strings.ReplaceAll(string(uuid.NewUUID()), "-", "")
 	return c
 }
 
@@ -948,5 +955,30 @@ func TestGetContainerUsageNanoCores(t *testing.T) {
 		// After the update, the cached value should be up-to-date
 		cached = provider.getContainerUsageNanoCores(test.stats)
 		assert.Equal(t, test.expected, cached, test.desc)
+	}
+}
+
+func TestExtractIDFromCgroupPath(t *testing.T) {
+	tests := []struct {
+		cgroupPath string
+		expected   string
+	}{
+		{
+			cgroupPath: "/kubepods/burstable/pod2fc932ce-fdcc-454b-97bd-aadfdeb4c340/9be25294016e2dc0340dd605ce1f57b492039b267a6a618a7ad2a7a58a740f32",
+			expected:   "9be25294016e2dc0340dd605ce1f57b492039b267a6a618a7ad2a7a58a740f32",
+		},
+		{
+			cgroupPath: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod2fc932ce_fdcc_454b_97bd_aadfdeb4c340.slice/cri-containerd-aaefb9d8feed2d453b543f6d928cede7a4dbefa6a0ae7c9b990dd234c56e93b9.scope",
+			expected:   "aaefb9d8feed2d453b543f6d928cede7a4dbefa6a0ae7c9b990dd234c56e93b9",
+		},
+		{
+			cgroupPath: "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod2fc932ce_fdcc_454b_97bd_aadfdeb4c340.slice/cri-o-aaefb9d8feed2d453b543f6d928cede7a4dbefa6a0ae7c9b990dd234c56e93b9.scope",
+			expected:   "aaefb9d8feed2d453b543f6d928cede7a4dbefa6a0ae7c9b990dd234c56e93b9",
+		},
+	}
+
+	for _, test := range tests {
+		id := extractIDFromCgroupPath(test.cgroupPath)
+		assert.Equal(t, test.expected, id)
 	}
 }

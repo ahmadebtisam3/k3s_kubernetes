@@ -292,7 +292,7 @@ func TestMakePayload(t *testing.T) {
 }
 
 func newTestHost(t *testing.T, clientset clientset.Interface) (string, volume.VolumeHost) {
-	tempDir, err := ioutil.TempDir("/tmp", "configmap_volume_test.")
+	tempDir, err := ioutil.TempDir("", "configmap_volume_test.")
 	if err != nil {
 		t.Fatalf("can't make a temp rootdir: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestCanSupport(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(configMapPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plugin.GetPluginName() != configMapPluginName {
 		t.Errorf("Wrong name: %s", plugin.GetPluginName())
@@ -340,7 +340,7 @@ func TestPlugin(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(configMapPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, UID: testPodUID}}
@@ -361,7 +361,7 @@ func TestPlugin(t *testing.T) {
 	}
 
 	volumePath := mounter.GetPath()
-	if !strings.HasSuffix(volumePath, fmt.Sprintf("pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name")) {
+	if !hasPathSuffix(volumePath, "pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name") {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
@@ -406,7 +406,7 @@ func TestPluginReboot(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(configMapPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, UID: testPodUID}}
@@ -421,7 +421,7 @@ func TestPluginReboot(t *testing.T) {
 	podMetadataDir := fmt.Sprintf("%v/pods/test_pod_uid3/plugins/kubernetes.io~configmap/test_volume_name", rootDir)
 	util.SetReady(podMetadataDir)
 	volumePath := mounter.GetPath()
-	if !strings.HasSuffix(volumePath, fmt.Sprintf("pods/test_pod_uid3/volumes/kubernetes.io~configmap/test_volume_name")) {
+	if !hasPathSuffix(volumePath, "pods/test_pod_uid3/volumes/kubernetes.io~configmap/test_volume_name") {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
@@ -464,7 +464,7 @@ func TestPluginOptional(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(configMapPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, UID: testPodUID}}
@@ -485,7 +485,7 @@ func TestPluginOptional(t *testing.T) {
 	}
 
 	volumePath := mounter.GetPath()
-	if !strings.HasSuffix(volumePath, fmt.Sprintf("pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name")) {
+	if !hasPathSuffix(volumePath, "pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name") {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
@@ -563,7 +563,7 @@ func TestPluginKeysOptional(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(configMapPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, UID: testPodUID}}
@@ -584,7 +584,7 @@ func TestPluginKeysOptional(t *testing.T) {
 	}
 
 	volumePath := mounter.GetPath()
-	if !strings.HasSuffix(volumePath, fmt.Sprintf("pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name")) {
+	if !hasPathSuffix(volumePath, "pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name") {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
@@ -643,7 +643,7 @@ func TestInvalidConfigMapSetup(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(configMapPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 
 	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, UID: testPodUID}}
@@ -664,7 +664,7 @@ func TestInvalidConfigMapSetup(t *testing.T) {
 	}
 
 	volumePath := mounter.GetPath()
-	if !strings.HasSuffix(volumePath, fmt.Sprintf("pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name")) {
+	if !hasPathSuffix(volumePath, "pods/test_pod_uid/volumes/kubernetes.io~configmap/test_volume_name") {
 		t.Errorf("Got unexpected path: %s", volumePath)
 	}
 
@@ -732,4 +732,8 @@ func doTestCleanAndTeardown(plugin volume.VolumePlugin, podUID types.UID, testVo
 	} else if !os.IsNotExist(err) {
 		t.Errorf("TearDown() failed: %v", err)
 	}
+}
+
+func hasPathSuffix(s, suffix string) bool {
+	return strings.HasSuffix(s, filepath.FromSlash(suffix))
 }

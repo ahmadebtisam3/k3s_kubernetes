@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package upgrades
+package apps
 
 import (
 	"context"
 	"fmt"
-	"time"
-
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,13 +27,11 @@ import (
 	e2ereplicaset "k8s.io/kubernetes/test/e2e/framework/replicaset"
 	"k8s.io/kubernetes/test/e2e/upgrades"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 const (
-	interval = 10 * time.Second
-	timeout  = 5 * time.Minute
 	rsName   = "rs"
 	scaleNum = 2
 )

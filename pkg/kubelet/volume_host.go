@@ -72,7 +72,7 @@ func NewInitializedVolumePluginMgr(
 		csiDriversSynced = csiDriverInformer.Informer().HasSynced
 
 	} else {
-		klog.Warning("kubeClient is nil. Skip initialization of CSIDriverLister")
+		klog.InfoS("KubeClient is nil. Skip initialization of CSIDriverLister")
 	}
 
 	kvh := &kubeletVolumeHost{
@@ -128,6 +128,16 @@ func (kvh *kubeletVolumeHost) GetPodsDir() string {
 	return kvh.kubelet.getPodsDir()
 }
 
+// GetHostIDsForPod if the pod uses user namespaces, takes the uid and gid
+// inside the container and returns the host UID and GID those are mapped to on
+// the host. If containerUID/containerGID is nil, then it returns the host
+// UID/GID for ID 0 inside the container.
+// If the pod is not using user namespaces, as there is no mapping needed, the
+// same containerUID and containerGID params are returned.
+func (kvh *kubeletVolumeHost) GetHostIDsForPod(pod *v1.Pod, containerUID, containerGID *int64) (hostUID, hostGID *int64, err error) {
+	return kvh.kubelet.getHostIDsForPod(pod, containerUID, containerGID)
+}
+
 func (kvh *kubeletVolumeHost) GetPodVolumeDir(podUID types.UID, pluginName string, volumeName string) string {
 	dir := kvh.kubelet.getPodVolumeDir(podUID, pluginName, volumeName)
 	if runtime.GOOS == "windows" {
@@ -176,13 +186,13 @@ func (kvh *kubeletVolumeHost) CSIDriversSynced() cache.InformerSynced {
 // WaitForCacheSync is a helper function that waits for cache sync for CSIDriverLister
 func (kvh *kubeletVolumeHost) WaitForCacheSync() error {
 	if kvh.csiDriversSynced == nil {
-		klog.Error("csiDriversSynced not found on KubeletVolumeHost")
+		klog.ErrorS(nil, "CsiDriversSynced not found on KubeletVolumeHost")
 		return fmt.Errorf("csiDriversSynced not found on KubeletVolumeHost")
 	}
 
 	synced := []cache.InformerSynced{kvh.csiDriversSynced}
 	if !cache.WaitForCacheSync(wait.NeverStop, synced...) {
-		klog.Warning("failed to wait for cache sync for CSIDriverLister")
+		klog.InfoS("Failed to wait for cache sync for CSIDriverLister")
 		return fmt.Errorf("failed to wait for cache sync for CSIDriverLister")
 	}
 
@@ -268,6 +278,20 @@ func (kvh *kubeletVolumeHost) GetNodeLabels() (map[string]string, error) {
 		return nil, fmt.Errorf("error retrieving node: %v", err)
 	}
 	return node.Labels, nil
+}
+
+func (kvh *kubeletVolumeHost) GetAttachedVolumesFromNodeStatus() (map[v1.UniqueVolumeName]string, error) {
+	node, err := kvh.kubelet.GetNode()
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving node: %v", err)
+	}
+	attachedVolumes := node.Status.VolumesAttached
+	result := map[v1.UniqueVolumeName]string{}
+	for i := range attachedVolumes {
+		attachedVolume := attachedVolumes[i]
+		result[attachedVolume.Name] = attachedVolume.DevicePath
+	}
+	return result, nil
 }
 
 func (kvh *kubeletVolumeHost) GetNodeName() types.NodeName {

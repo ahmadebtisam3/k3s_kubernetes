@@ -22,15 +22,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/spf13/cobra"
+	"k8s.io/utils/pointer"
+
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
-	"k8s.io/utils/pointer"
 )
 
 func TestGenerateDebugContainer(t *testing.T) {
@@ -234,7 +235,18 @@ func TestGenerateDebugContainer(t *testing.T) {
 			if tc.pod == nil {
 				tc.pod = &corev1.Pod{}
 			}
-			if diff := cmp.Diff(tc.expected, tc.opts.generateDebugContainer(tc.pod)); diff != "" {
+
+			applier, err := NewProfileApplier(ProfileLegacy)
+			if err != nil {
+				t.Fatalf("fail to create %s profile", ProfileLegacy)
+			}
+			tc.opts.applier = applier
+
+			_, debugContainer, err := tc.opts.generateDebugContainer(tc.pod)
+			if err != nil {
+				t.Fatalf("fail to generate debug container: %v", err)
+			}
+			if diff := cmp.Diff(tc.expected, debugContainer); diff != "" {
 				t.Error("unexpected diff in generated object: (-want +got):\n", diff)
 			}
 		})
@@ -1004,6 +1016,11 @@ func TestGeneratePodCopyWithDebugContainer(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			tc.opts.applier, err = NewProfileApplier(ProfileLegacy)
+			if err != nil {
+				t.Fatalf("Fail to create legacy profile: %v", err)
+			}
 			tc.opts.IOStreams = genericclioptions.NewTestIOStreamsDiscard()
 			suffixCounter = 0
 
@@ -1027,13 +1044,18 @@ func TestGenerateNodeDebugPod(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name, nodeName string
-		opts           *DebugOptions
-		expected       *corev1.Pod
+		name     string
+		node     *corev1.Node
+		opts     *DebugOptions
+		expected *corev1.Pod
 	}{
 		{
-			name:     "minimum options",
-			nodeName: "node-XXX",
+			name: "minimum options",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node-XXX",
+				},
+			},
 			opts: &DebugOptions{
 				Image:      "busybox",
 				PullPolicy: corev1.PullIfNotPresent,
@@ -1070,12 +1092,21 @@ func TestGenerateNodeDebugPod(t *testing.T) {
 							},
 						},
 					},
+					Tolerations: []corev1.Toleration{
+						{
+							Operator: corev1.TolerationOpExists,
+						},
+					},
 				},
 			},
 		},
 		{
-			name:     "debug args as container command",
-			nodeName: "node-XXX",
+			name: "debug args as container command",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node-XXX",
+				},
+			},
 			opts: &DebugOptions{
 				Args:       []string{"/bin/echo", "one", "two", "three"},
 				Container:  "custom-debugger",
@@ -1115,12 +1146,21 @@ func TestGenerateNodeDebugPod(t *testing.T) {
 							},
 						},
 					},
+					Tolerations: []corev1.Toleration{
+						{
+							Operator: corev1.TolerationOpExists,
+						},
+					},
 				},
 			},
 		},
 		{
-			name:     "debug args as container args",
-			nodeName: "node-XXX",
+			name: "debug args as container args",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node-XXX",
+				},
+			},
 			opts: &DebugOptions{
 				ArgsOnly:   true,
 				Container:  "custom-debugger",
@@ -1161,15 +1201,28 @@ func TestGenerateNodeDebugPod(t *testing.T) {
 							},
 						},
 					},
+					Tolerations: []corev1.Toleration{
+						{
+							Operator: corev1.TolerationOpExists,
+						},
+					},
 				},
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			tc.opts.applier, err = NewProfileApplier(ProfileLegacy)
+			if err != nil {
+				t.Fatalf("Fail to create legacy profile: %v", err)
+			}
 			tc.opts.IOStreams = genericclioptions.NewTestIOStreamsDiscard()
 			suffixCounter = 0
 
-			pod := tc.opts.generateNodeDebugPod(tc.nodeName)
+			pod, err := tc.opts.generateNodeDebugPod(tc.node)
+			if err != nil {
+				t.Fatalf("Fail to generate node debug pod: %v", err)
+			}
 			if diff := cmp.Diff(tc.expected, pod); diff != "" {
 				t.Error("unexpected diff in generated object: (-want +got):\n", diff)
 			}
@@ -1178,7 +1231,7 @@ func TestGenerateNodeDebugPod(t *testing.T) {
 }
 
 func TestCompleteAndValidate(t *testing.T) {
-	tf := cmdtesting.NewTestFactory()
+	tf := cmdtesting.NewTestFactory().WithNamespace("test")
 	ioStreams, _, _, _ := genericclioptions.NewTestIOStreams()
 	cmpFilter := cmp.FilterPath(func(p cmp.Path) bool {
 		switch p.String() {
@@ -1225,9 +1278,10 @@ func TestCompleteAndValidate(t *testing.T) {
 			wantOpts: &DebugOptions{
 				Args:           []string{},
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				PullPolicy:     corev1.PullPolicy("Always"),
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 			},
 		},
@@ -1237,8 +1291,9 @@ func TestCompleteAndValidate(t *testing.T) {
 			wantOpts: &DebugOptions{
 				Args:           []string{},
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod1", "mypod2"},
 			},
 		},
@@ -1248,8 +1303,9 @@ func TestCompleteAndValidate(t *testing.T) {
 			wantOpts: &DebugOptions{
 				Args:           []string{"echo", "1", "2"},
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod1", "mypod2"},
 			},
 		},
@@ -1261,8 +1317,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Attach:         false,
 				Image:          "busybox",
 				Interactive:    true,
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 				TTY:            true,
 			},
@@ -1272,10 +1329,11 @@ func TestCompleteAndValidate(t *testing.T) {
 			args: "--image=busybox --env=FOO=BAR mypod",
 			wantOpts: &DebugOptions{
 				Args:           []string{},
-				Env:            []v1.EnvVar{{Name: "FOO", Value: "BAR"}},
+				Env:            []corev1.EnvVar{{Name: "FOO", Value: "BAR"}},
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 			},
 		},
@@ -1287,8 +1345,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Attach:         true,
 				Image:          "busybox",
 				Interactive:    true,
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 				TTY:            true,
 			},
@@ -1300,8 +1359,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Args:           []string{},
 				Container:      "debugger",
 				Image:          "myproj/debug-tools",
-				Namespace:      "default",
+				Namespace:      "test",
 				PullPolicy:     corev1.PullPolicy("Always"),
+				Profile:        ProfileLegacy,
 				ShareProcesses: true,
 				TargetNames:    []string{"mypod"},
 			},
@@ -1340,8 +1400,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				CopyTo:         "my-debugger",
 				Image:          "busybox",
 				Interactive:    true,
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 				TTY:            true,
 			},
@@ -1354,8 +1415,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Container:      "my-container",
 				CopyTo:         "my-debugger",
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 			},
 		},
@@ -1367,8 +1429,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Attach:         true,
 				CopyTo:         "my-debugger",
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 			},
 		},
@@ -1380,8 +1443,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Container:      "my-container",
 				CopyTo:         "my-debugger",
 				Image:          "busybox",
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 			},
 		},
@@ -1391,12 +1455,13 @@ func TestCompleteAndValidate(t *testing.T) {
 			wantOpts: &DebugOptions{
 				Args:      []string{},
 				CopyTo:    "my-debugger",
-				Namespace: "default",
+				Namespace: "test",
 				SetImages: map[string]string{
 					"*":   "busybox",
 					"app": "app-debugger",
 				},
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 			},
 		},
@@ -1409,12 +1474,13 @@ func TestCompleteAndValidate(t *testing.T) {
 				CopyTo:      "my-debugger",
 				Image:       "debian",
 				Interactive: true,
-				Namespace:   "default",
+				Namespace:   "test",
 				SetImages: map[string]string{
 					"app":     "app:debug",
 					"sidecar": "sidecar:debug",
 				},
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 				TTY:            true,
 			},
@@ -1428,8 +1494,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Container:      "mycontainer",
 				CopyTo:         "my-debugger",
 				Interactive:    true,
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"mypod"},
 				TTY:            true,
 			},
@@ -1467,8 +1534,9 @@ func TestCompleteAndValidate(t *testing.T) {
 				Attach:         true,
 				Image:          "busybox",
 				Interactive:    true,
-				Namespace:      "default",
+				Namespace:      "test",
 				ShareProcesses: true,
+				Profile:        ProfileLegacy,
 				TargetNames:    []string{"node/mynode"},
 				TTY:            true,
 			},
@@ -1511,7 +1579,7 @@ func TestCompleteAndValidate(t *testing.T) {
 					if gotError != nil {
 						return
 					}
-					gotError = opts.Validate(cmd)
+					gotError = opts.Validate()
 				},
 			}
 			cmd.SetArgs(strings.Split(tc.args, " "))

@@ -20,19 +20,19 @@ import (
 	"fmt"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	"k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/apis/discovery/validation"
 	endpointutil "k8s.io/kubernetes/pkg/controller/util/endpoint"
 	"k8s.io/kubernetes/pkg/features"
@@ -40,28 +40,7 @@ import (
 )
 
 // podToEndpoint returns an Endpoint object generated from a Pod, a Node, and a Service for a particular addressType.
-func podToEndpoint(pod *corev1.Pod, node *corev1.Node, service *corev1.Service, addressType discovery.AddressType) discovery.Endpoint {
-	// Build out topology information. This is currently limited to hostname,
-	// zone, and region, but this will be expanded in the future.
-	topology := map[string]string{}
-
-	if pod.Spec.NodeName != "" {
-		topology["kubernetes.io/hostname"] = pod.Spec.NodeName
-	}
-
-	if node != nil {
-		topologyLabels := []string{
-			"topology.kubernetes.io/zone",
-			"topology.kubernetes.io/region",
-		}
-
-		for _, topologyLabel := range topologyLabels {
-			if node.Labels[topologyLabel] != "" {
-				topology[topologyLabel] = node.Labels[topologyLabel]
-			}
-		}
-	}
-
+func podToEndpoint(pod *v1.Pod, node *v1.Node, service *v1.Service, addressType discovery.AddressType) discovery.Endpoint {
 	serving := podutil.IsPodReady(pod)
 	terminating := pod.DeletionTimestamp != nil
 	// For compatibility reasons, "ready" should never be "true" if a pod is terminatng, unless
@@ -72,13 +51,11 @@ func podToEndpoint(pod *corev1.Pod, node *corev1.Node, service *corev1.Service, 
 		Conditions: discovery.EndpointConditions{
 			Ready: &ready,
 		},
-		Topology: topology,
-		TargetRef: &corev1.ObjectReference{
-			Kind:            "Pod",
-			Namespace:       pod.ObjectMeta.Namespace,
-			Name:            pod.ObjectMeta.Name,
-			UID:             pod.ObjectMeta.UID,
-			ResourceVersion: pod.ObjectMeta.ResourceVersion,
+		TargetRef: &v1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: pod.ObjectMeta.Namespace,
+			Name:      pod.ObjectMeta.Name,
+			UID:       pod.ObjectMeta.UID,
 		},
 	}
 
@@ -87,8 +64,13 @@ func podToEndpoint(pod *corev1.Pod, node *corev1.Node, service *corev1.Service, 
 		ep.Conditions.Terminating = &terminating
 	}
 
-	if pod.Spec.NodeName != "" && utilfeature.DefaultFeatureGate.Enabled(features.EndpointSliceNodeName) {
+	if pod.Spec.NodeName != "" {
 		ep.NodeName = &pod.Spec.NodeName
+	}
+
+	if node != nil && node.Labels[v1.LabelTopologyZone] != "" {
+		zone := node.Labels[v1.LabelTopologyZone]
+		ep.Zone = &zone
 	}
 
 	if endpointutil.ShouldSetHostname(pod, service) {
@@ -100,7 +82,7 @@ func podToEndpoint(pod *corev1.Pod, node *corev1.Node, service *corev1.Service, 
 
 // getEndpointPorts returns a list of EndpointPorts generated from a Service
 // and Pod.
-func getEndpointPorts(service *corev1.Service, pod *corev1.Pod) []discovery.EndpointPort {
+func getEndpointPorts(service *v1.Service, pod *v1.Pod) []discovery.EndpointPort {
 	endpointPorts := []discovery.EndpointPort{}
 
 	// Allow headless service not to have ports.
@@ -132,7 +114,7 @@ func getEndpointPorts(service *corev1.Service, pod *corev1.Pod) []discovery.Endp
 }
 
 // getEndpointAddresses returns a list of addresses generated from a pod status.
-func getEndpointAddresses(podStatus corev1.PodStatus, service *corev1.Service, addressType discovery.AddressType) []string {
+func getEndpointAddresses(podStatus v1.PodStatus, service *v1.Service, addressType discovery.AddressType) []string {
 	addresses := []string{}
 
 	for _, podIP := range podStatus.PodIPs {
@@ -149,28 +131,9 @@ func getEndpointAddresses(podStatus corev1.PodStatus, service *corev1.Service, a
 	return addresses
 }
 
-// endpointsEqualBeyondHash returns true if endpoints have equal attributes
-// but excludes equality checks that would have already been covered with
-// endpoint hashing (see hashEndpoint func for more info).
-func endpointsEqualBeyondHash(ep1, ep2 *discovery.Endpoint) bool {
-	if !apiequality.Semantic.DeepEqual(ep1.Topology, ep2.Topology) {
-		return false
-	}
-
-	if boolPtrChanged(ep1.Conditions.Ready, ep2.Conditions.Ready) {
-		return false
-	}
-
-	if objectRefPtrChanged(ep1.TargetRef, ep2.TargetRef) {
-		return false
-	}
-
-	return true
-}
-
 // newEndpointSlice returns an EndpointSlice generated from a service and
 // endpointMeta.
-func newEndpointSlice(service *corev1.Service, endpointMeta *endpointMeta) *discovery.EndpointSlice {
+func newEndpointSlice(service *v1.Service, endpointMeta *endpointMeta) *discovery.EndpointSlice {
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Service"}
 	ownerRef := metav1.NewControllerRef(service, gvk)
 	epSlice := &discovery.EndpointSlice{
@@ -200,32 +163,9 @@ func getEndpointSlicePrefix(serviceName string) string {
 	return prefix
 }
 
-// boolPtrChanged returns true if a set of bool pointers have different values.
-func boolPtrChanged(ptr1, ptr2 *bool) bool {
-	if (ptr1 == nil) != (ptr2 == nil) {
-		return true
-	}
-	if ptr1 != nil && ptr2 != nil && *ptr1 != *ptr2 {
-		return true
-	}
-	return false
-}
-
-// objectRefPtrChanged returns true if a set of object ref pointers have
-// different values.
-func objectRefPtrChanged(ref1, ref2 *corev1.ObjectReference) bool {
-	if (ref1 == nil) != (ref2 == nil) {
-		return true
-	}
-	if ref1 != nil && ref2 != nil && !apiequality.Semantic.DeepEqual(*ref1, *ref2) {
-		return true
-	}
-	return false
-}
-
 // ownedBy returns true if the provided EndpointSlice is owned by the provided
 // Service.
-func ownedBy(endpointSlice *discovery.EndpointSlice, svc *corev1.Service) bool {
+func ownedBy(endpointSlice *discovery.EndpointSlice, svc *v1.Service) bool {
 	for _, o := range endpointSlice.OwnerReferences {
 		if o.UID == svc.UID && o.Kind == "Service" && o.APIVersion == "v1" {
 			return true
@@ -281,9 +221,9 @@ func addTriggerTimeAnnotation(endpointSlice *discovery.EndpointSlice, triggerTim
 	}
 
 	if !triggerTime.IsZero() {
-		endpointSlice.Annotations[corev1.EndpointsLastChangeTriggerTime] = triggerTime.Format(time.RFC3339Nano)
+		endpointSlice.Annotations[v1.EndpointsLastChangeTriggerTime] = triggerTime.UTC().Format(time.RFC3339Nano)
 	} else { // No new trigger time, clear the annotation.
-		delete(endpointSlice.Annotations, corev1.EndpointsLastChangeTriggerTime)
+		delete(endpointSlice.Annotations, v1.EndpointsLastChangeTriggerTime)
 	}
 }
 
@@ -303,7 +243,7 @@ func serviceControllerKey(endpointSlice *discovery.EndpointSlice) (string, error
 // setEndpointSliceLabels returns a map with the new endpoint slices labels and true if there was an update.
 // Slices labels must be equivalent to the Service labels except for the reserved IsHeadlessService, LabelServiceName and LabelManagedBy labels
 // Changes to IsHeadlessService, LabelServiceName and LabelManagedBy labels on the Service do not result in updates to EndpointSlice labels.
-func setEndpointSliceLabels(epSlice *discovery.EndpointSlice, service *corev1.Service) (map[string]string, bool) {
+func setEndpointSliceLabels(epSlice *discovery.EndpointSlice, service *v1.Service) (map[string]string, bool) {
 	updated := false
 	epLabels := make(map[string]string)
 	svcLabels := make(map[string]string)
@@ -367,7 +307,7 @@ func (sl endpointSliceEndpointLen) Less(i, j int) bool {
 }
 
 // returns a map of address types used by a service
-func getAddressTypesForService(service *corev1.Service) map[discovery.AddressType]struct{} {
+func getAddressTypesForService(service *v1.Service) map[discovery.AddressType]struct{} {
 	serviceSupportedAddresses := make(map[discovery.AddressType]struct{})
 	// TODO: (khenidak) when address types are removed in favor of
 	// v1.IPFamily this will need to be removed, and work directly with
@@ -376,11 +316,11 @@ func getAddressTypesForService(service *corev1.Service) map[discovery.AddressTyp
 	// IMPORTANT: we assume that IP of (discovery.AddressType enum) is never in use
 	// as it gets deprecated
 	for _, family := range service.Spec.IPFamilies {
-		if family == corev1.IPv4Protocol {
+		if family == v1.IPv4Protocol {
 			serviceSupportedAddresses[discovery.AddressTypeIPv4] = struct{}{}
 		}
 
-		if family == corev1.IPv6Protocol {
+		if family == v1.IPv6Protocol {
 			serviceSupportedAddresses[discovery.AddressTypeIPv6] = struct{}{}
 		}
 	}
@@ -404,13 +344,13 @@ func getAddressTypesForService(service *corev1.Service) map[discovery.AddressTyp
 	// this ensures that traffic is not disrupted  until then. But *may*
 	// include undesired families for headless services until then.
 
-	if len(service.Spec.ClusterIP) > 0 && service.Spec.ClusterIP != corev1.ClusterIPNone { // headfull
+	if len(service.Spec.ClusterIP) > 0 && service.Spec.ClusterIP != v1.ClusterIPNone { // headfull
 		addrType := discovery.AddressTypeIPv4
 		if utilnet.IsIPv6String(service.Spec.ClusterIP) {
 			addrType = discovery.AddressTypeIPv6
 		}
 		serviceSupportedAddresses[addrType] = struct{}{}
-		klog.V(2).Infof("couldn't find ipfamilies for headless service: %v/%v. This could happen if controller manager is connected to an old apiserver that does not support ip families yet. EndpointSlices for this Service will use %s as the IP Family based on familyOf(ClusterIP:%v).", service.Namespace, service.Name, addrType, service.Spec.ClusterIP)
+		klog.V(2).Infof("couldn't find ipfamilies for service: %v/%v. This could happen if controller manager is connected to an old apiserver that does not support ip families yet. EndpointSlices for this Service will use %s as the IP Family based on familyOf(ClusterIP:%v).", service.Namespace, service.Name, addrType, service.Spec.ClusterIP)
 		return serviceSupportedAddresses
 	}
 
@@ -423,4 +363,45 @@ func getAddressTypesForService(service *corev1.Service) map[discovery.AddressTyp
 	serviceSupportedAddresses[discovery.AddressTypeIPv6] = struct{}{}
 	klog.V(2).Infof("couldn't find ipfamilies for headless service: %v/%v likely because controller manager is likely connected to an old apiserver that does not support ip families yet. The service endpoint slice will use dual stack families until api-server default it correctly", service.Namespace, service.Name)
 	return serviceSupportedAddresses
+}
+
+func unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete []*discovery.EndpointSlice) []*discovery.EndpointSlice {
+	changedSliceNames := sets.String{}
+	for _, slice := range slicesToUpdate {
+		changedSliceNames.Insert(slice.Name)
+	}
+	for _, slice := range slicesToDelete {
+		changedSliceNames.Insert(slice.Name)
+	}
+	unchangedSlices := []*discovery.EndpointSlice{}
+	for _, slice := range existingSlices {
+		if !changedSliceNames.Has(slice.Name) {
+			unchangedSlices = append(unchangedSlices, slice)
+		}
+	}
+
+	return unchangedSlices
+}
+
+// hintsEnabled returns true if the provided annotations include a
+// v1.AnnotationTopologyAwareHints key with a value set to "Auto" or "auto".
+func hintsEnabled(annotations map[string]string) bool {
+	val, ok := annotations[v1.AnnotationTopologyAwareHints]
+	if !ok {
+		return false
+	}
+	return val == "Auto" || val == "auto"
+}
+
+// managedByChanged returns true if one of the provided EndpointSlices is
+// managed by the EndpointSlice controller while the other is not.
+func managedByChanged(endpointSlice1, endpointSlice2 *discovery.EndpointSlice) bool {
+	return managedByController(endpointSlice1) != managedByController(endpointSlice2)
+}
+
+// managedByController returns true if the controller of the provided
+// EndpointSlices is the EndpointSlice controller.
+func managedByController(endpointSlice *discovery.EndpointSlice) bool {
+	managedBy, _ := endpointSlice.Labels[discovery.LabelManagedBy]
+	return managedBy == controllerName
 }

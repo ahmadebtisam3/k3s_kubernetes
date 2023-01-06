@@ -188,7 +188,7 @@ egressSelections:
 						},
 					},
 					{
-						Name: "master",
+						Name: "controlplane",
 						Connection: apiserver.Connection{
 							ProxyProtocol: "HTTPConnect",
 							Transport: &apiserver.Transport{
@@ -244,7 +244,7 @@ spec:
           hostPath:
             path: /etc/srv/kubernetes/pki/konnectivity-agent
       containers:
-        - image: k8s.gcr.io/proxy-agent:v0.0.3
+        - image: registry.k8s.io/proxy-agent:v0.0.3
           name: proxy-agent
           command: ["/proxy-agent"]
           args: ["--caCert=/etc/srv/kubernetes/pki/proxy-agent/ca.crt", "--agentCert=/etc/srv/kubernetes/pki/proxy-agent/client.crt", "--agentKey=/etc/srv/kubernetes/pki/proxy-agent/client.key", "--proxyServerHost=127.0.0.1", "--proxyServerPort=8132"]
@@ -338,7 +338,7 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 				},
 				EgressSelections: []apiserver.EgressSelection{
 					{
-						Name: "master",
+						Name: "controlplane",
 						Connection: apiserver.Connection{
 							ProxyProtocol: apiserver.ProtocolDirect,
 							Transport:     &apiserver.Transport{},
@@ -512,7 +512,7 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 			},
 		},
 		{
-			name:        "both master and controlplane egress selection configured",
+			name:        "duplicate egress selections configured",
 			expectError: true,
 			contents: &apiserver.EgressSelectorConfiguration{
 				TypeMeta: metav1.TypeMeta{
@@ -527,7 +527,7 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 						},
 					},
 					{
-						Name: "master",
+						Name: "controlplane",
 						Connection: apiserver.Connection{
 							ProxyProtocol: apiserver.ProtocolDirect,
 						},

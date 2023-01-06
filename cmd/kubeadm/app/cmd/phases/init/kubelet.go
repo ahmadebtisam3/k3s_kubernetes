@@ -20,7 +20,9 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
+
 	"k8s.io/klog/v2"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
@@ -46,6 +48,7 @@ func NewKubeletStartPhase() workflow.Phase {
 			options.CfgPath,
 			options.NodeCRISocket,
 			options.NodeName,
+			options.Patches,
 		},
 	}
 }
@@ -72,7 +75,7 @@ func runKubeletStart(c workflow.RunData) error {
 	}
 
 	// Write the kubelet configuration file to disk.
-	if err := kubeletphase.WriteConfigToDisk(&data.Cfg().ClusterConfiguration, data.KubeletDir()); err != nil {
+	if err := kubeletphase.WriteConfigToDisk(&data.Cfg().ClusterConfiguration, data.KubeletDir(), data.PatchesDir(), data.OutputWriter()); err != nil {
 		return errors.Wrap(err, "error writing kubelet configuration to disk")
 	}
 

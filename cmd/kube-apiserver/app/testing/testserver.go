@@ -19,7 +19,6 @@ package testing
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -28,28 +27,39 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/apiserver/pkg/storageversion"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/util/cert"
+	"k8s.io/kube-aggregator/pkg/apiserver"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	testutil "k8s.io/kubernetes/test/utils"
+
+	"k8s.io/klog/v2"
 )
+
+// This key is for testing purposes only and is not considered secure.
+const ecdsaPrivateKey = `-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIEZmTmUhuanLjPA2CLquXivuwBDHTt5XYwgIr/kA1LtRoAoGCCqGSM49
+AwEHoUQDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPLX2i8uIp/C/ASqiIGUeeKQtX0
+/IR3qCXyThP/dbCiHrF3v1cuhBOHY8CLVg==
+-----END EC PRIVATE KEY-----`
 
 // TearDownFunc is to be called to tear down a test server.
 type TearDownFunc func()
 
 // TestServerInstanceOptions Instance options the TestServer
 type TestServerInstanceOptions struct {
-	// DisableStorageCleanup Disable the automatic storage cleanup
-	DisableStorageCleanup bool
 	// Enable cert-auth for the kube-apiserver
 	EnableCertAuth bool
 	// Wrap the storage version interface of the created server's generic server.
@@ -58,10 +68,12 @@ type TestServerInstanceOptions struct {
 
 // TestServer return values supplied by kube-test-ApiServer
 type TestServer struct {
-	ClientConfig *restclient.Config        // Rest client config
-	ServerOpts   *options.ServerRunOptions // ServerOpts
-	TearDownFn   TearDownFunc              // TearDown function
-	TmpDir       string                    // Temp Dir used, by the apiserver
+	ClientConfig      *restclient.Config        // Rest client config
+	ServerOpts        *options.ServerRunOptions // ServerOpts
+	TearDownFn        TearDownFunc              // TearDown function
+	TmpDir            string                    // Temp Dir used, by the apiserver
+	EtcdClient        *clientv3.Client          // used by tests that need to check data migrated from APIs that are no longer served
+	EtcdStoragePrefix string                    // storage prefix in etcd
 }
 
 // Logger allows t.Testing and b.Testing to be passed to StartTestServer and StartTestServerOrDie
@@ -74,8 +86,7 @@ type Logger interface {
 // NewDefaultTestServerOptions Default options for TestServer instances
 func NewDefaultTestServerOptions() *TestServerInstanceOptions {
 	return &TestServerInstanceOptions{
-		DisableStorageCleanup: false,
-		EnableCertAuth:        true,
+		EnableCertAuth: true,
 	}
 }
 
@@ -83,40 +94,41 @@ func NewDefaultTestServerOptions() *TestServerInstanceOptions {
 // and location of the tmpdir are returned.
 //
 // Note: we return a tear-down func instead of a stop channel because the later will leak temporary
-// 		 files that because Golang testing's call to os.Exit will not give a stop channel go routine
-// 		 enough time to remove temporary files.
+//
+//	files that because Golang testing's call to os.Exit will not give a stop channel go routine
+//	enough time to remove temporary files.
 func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, customFlags []string, storageConfig *storagebackend.Config) (result TestServer, err error) {
 	if instanceOptions == nil {
 		instanceOptions = NewDefaultTestServerOptions()
 	}
 
-	// TODO : Remove TrackStorageCleanup below when PR
-	// https://github.com/kubernetes/kubernetes/pull/50690
-	// merges as that shuts down storage properly
-	if !instanceOptions.DisableStorageCleanup {
-		registry.TrackStorageCleanup()
+	result.TmpDir, err = os.MkdirTemp("", "kubernetes-kube-apiserver")
+	if err != nil {
+		return result, fmt.Errorf("failed to create temp dir: %v", err)
 	}
 
 	stopCh := make(chan struct{})
+	var errCh chan error
 	tearDown := func() {
-		if !instanceOptions.DisableStorageCleanup {
-			registry.CleanupStorage()
-		}
+		// Closing stopCh is stopping apiserver and cleaning up
+		// after itself, including shutting down its storage layer.
 		close(stopCh)
-		if len(result.TmpDir) != 0 {
-			os.RemoveAll(result.TmpDir)
+
+		// If the apiserver was started, let's wait for it to
+		// shutdown clearly.
+		if errCh != nil {
+			err, ok := <-errCh
+			if ok && err != nil {
+				klog.Errorf("Failed to shutdown test server clearly: %v", err)
+			}
 		}
+		os.RemoveAll(result.TmpDir)
 	}
 	defer func() {
 		if result.TearDownFn == nil {
 			tearDown()
 		}
 	}()
-
-	result.TmpDir, err = ioutil.TempDir("", "kubernetes-kube-apiserver")
-	if err != nil {
-		return result, fmt.Errorf("failed to create temp dir: %v", err)
-	}
 
 	fs := pflag.NewFlagSet("test", pflag.PanicOnError)
 
@@ -142,7 +154,7 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 			return result, err
 		}
 		proxyCACertFile := path.Join(s.SecureServing.ServerCert.CertDirectory, "proxy-ca.crt")
-		if err := ioutil.WriteFile(proxyCACertFile, testutil.EncodeCertPEM(proxySigningCert), 0644); err != nil {
+		if err := os.WriteFile(proxyCACertFile, testutil.EncodeCertPEM(proxySigningCert), 0644); err != nil {
 			return result, err
 		}
 		s.Authentication.RequestHeader.ClientCAFile = proxyCACertFile
@@ -155,7 +167,7 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 			return result, err
 		}
 		clientCACertFile := path.Join(s.SecureServing.ServerCert.CertDirectory, "client-ca.crt")
-		if err := ioutil.WriteFile(clientCACertFile, testutil.EncodeCertPEM(clientSigningCert), 0644); err != nil {
+		if err := os.WriteFile(clientCACertFile, testutil.EncodeCertPEM(clientSigningCert), 0644); err != nil {
 			return result, err
 		}
 		s.Authentication.ClientCert.ClientCA = clientCACertFile
@@ -176,23 +188,41 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 	if err := fs.Parse(customFlags); err != nil {
 		return result, err
 	}
+
+	saSigningKeyFile, err := os.CreateTemp("/tmp", "insecure_test_key")
+	if err != nil {
+		t.Fatalf("create temp file failed: %v", err)
+	}
+	defer os.RemoveAll(saSigningKeyFile.Name())
+	if err = os.WriteFile(saSigningKeyFile.Name(), []byte(ecdsaPrivateKey), 0666); err != nil {
+		t.Fatalf("write file %s failed: %v", saSigningKeyFile.Name(), err)
+	}
+	s.ServiceAccountSigningKeyFile = saSigningKeyFile.Name()
+	s.Authentication.ServiceAccounts.Issuers = []string{"https://foo.bar.example.com"}
+	s.Authentication.ServiceAccounts.KeyFiles = []string{saSigningKeyFile.Name()}
+
 	completedOptions, err := app.Complete(s)
 	if err != nil {
 		return result, fmt.Errorf("failed to set default ServerRunOptions: %v", err)
 	}
 
+	if errs := completedOptions.Validate(); len(errs) != 0 {
+		return result, fmt.Errorf("failed to validate ServerRunOptions: %v", utilerrors.NewAggregate(errs))
+	}
+
 	t.Logf("runtime-config=%v", completedOptions.APIEnablement.RuntimeConfig)
 	t.Logf("Starting kube-apiserver on port %d...", s.SecureServing.BindPort)
-	server, err := app.CreateServerChain(completedOptions, stopCh)
-	if instanceOptions.StorageVersionWrapFunc != nil {
-		server.GenericAPIServer.StorageVersionManager = instanceOptions.StorageVersionWrapFunc(server.GenericAPIServer.StorageVersionManager)
-	}
+	server, err := app.CreateServerChain(completedOptions)
 	if err != nil {
 		return result, fmt.Errorf("failed to create server chain: %v", err)
 	}
+	if instanceOptions.StorageVersionWrapFunc != nil {
+		server.GenericAPIServer.StorageVersionManager = instanceOptions.StorageVersionWrapFunc(server.GenericAPIServer.StorageVersionManager)
+	}
 
-	errCh := make(chan error)
+	errCh = make(chan error)
 	go func(stopCh <-chan struct{}) {
+		defer close(errCh)
 		prepared, err := server.PrepareRun()
 		if err != nil {
 			errCh <- err
@@ -201,54 +231,82 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 		}
 	}(stopCh)
 
-	// skip healthz check when we test the storage version manager poststart hook
-	if instanceOptions.StorageVersionWrapFunc == nil {
-		t.Logf("Waiting for /healthz to be ok...")
+	t.Logf("Waiting for /healthz to be ok...")
 
-		client, err := kubernetes.NewForConfig(server.GenericAPIServer.LoopbackClientConfig)
-		if err != nil {
-			return result, fmt.Errorf("failed to create a client: %v", err)
+	client, err := kubernetes.NewForConfig(server.GenericAPIServer.LoopbackClientConfig)
+	if err != nil {
+		return result, fmt.Errorf("failed to create a client: %v", err)
+	}
+
+	// wait until healthz endpoint returns ok
+	err = wait.Poll(100*time.Millisecond, time.Minute, func() (bool, error) {
+		select {
+		case err := <-errCh:
+			return false, err
+		default:
 		}
 
-		// wait until healthz endpoint returns ok
-		err = wait.Poll(100*time.Millisecond, time.Minute, func() (bool, error) {
-			select {
-			case err := <-errCh:
-				return false, err
-			default:
-			}
+		req := client.CoreV1().RESTClient().Get().AbsPath("/healthz")
+		// The storage version bootstrap test wraps the storage version post-start
+		// hook, so the hook won't become health when the server bootstraps
+		if instanceOptions.StorageVersionWrapFunc != nil {
+			// We hardcode the param instead of having a new instanceOptions field
+			// to avoid confusing users with more options.
+			storageVersionCheck := fmt.Sprintf("poststarthook/%s", apiserver.StorageVersionPostStartHookName)
+			req.Param("exclude", storageVersionCheck)
+		}
+		result := req.Do(context.TODO())
+		status := 0
+		result.StatusCode(&status)
+		if status == 200 {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to wait for /healthz to return ok: %v", err)
+	}
 
-			result := client.CoreV1().RESTClient().Get().AbsPath("/healthz").Do(context.TODO())
-			status := 0
-			result.StatusCode(&status)
-			if status == 200 {
-				return true, nil
+	// wait until default namespace is created
+	err = wait.Poll(100*time.Millisecond, 30*time.Second, func() (bool, error) {
+		select {
+		case err := <-errCh:
+			return false, err
+		default:
+		}
+
+		if _, err := client.CoreV1().Namespaces().Get(context.TODO(), "default", metav1.GetOptions{}); err != nil {
+			if !errors.IsNotFound(err) {
+				t.Logf("Unable to get default namespace: %v", err)
 			}
 			return false, nil
-		})
-		if err != nil {
-			return result, fmt.Errorf("failed to wait for /healthz to return ok: %v", err)
 		}
+		return true, nil
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to wait for default namespace to be created: %v", err)
+	}
 
-		// wait until default namespace is created
-		err = wait.Poll(100*time.Millisecond, 30*time.Second, func() (bool, error) {
-			select {
-			case err := <-errCh:
-				return false, err
-			default:
-			}
-
-			if _, err := client.CoreV1().Namespaces().Get(context.TODO(), "default", metav1.GetOptions{}); err != nil {
-				if !errors.IsNotFound(err) {
-					t.Logf("Unable to get default namespace: %v", err)
-				}
-				return false, nil
-			}
-			return true, nil
-		})
-		if err != nil {
-			return result, fmt.Errorf("failed to wait for default namespace to be created: %v", err)
-		}
+	tlsInfo := transport.TLSInfo{
+		CertFile:      storageConfig.Transport.CertFile,
+		KeyFile:       storageConfig.Transport.KeyFile,
+		TrustedCAFile: storageConfig.Transport.TrustedCAFile,
+	}
+	tlsConfig, err := tlsInfo.ClientConfig()
+	if err != nil {
+		return result, err
+	}
+	etcdConfig := clientv3.Config{
+		Endpoints:   storageConfig.Transport.ServerList,
+		DialTimeout: 20 * time.Second,
+		DialOptions: []grpc.DialOption{
+			grpc.WithBlock(), // block until the underlying connection is up
+		},
+		TLS: tlsConfig,
+	}
+	etcdClient, err := clientv3.New(etcdConfig)
+	if err != nil {
+		return result, err
 	}
 
 	// from here the caller must call tearDown
@@ -256,7 +314,12 @@ func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, custo
 	result.ClientConfig.QPS = 1000
 	result.ClientConfig.Burst = 10000
 	result.ServerOpts = s
-	result.TearDownFn = tearDown
+	result.TearDownFn = func() {
+		tearDown()
+		etcdClient.Close()
+	}
+	result.EtcdClient = etcdClient
+	result.EtcdStoragePrefix = storageConfig.Prefix
 
 	return result, nil
 }

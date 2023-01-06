@@ -64,11 +64,11 @@ func TestStorageVersionGarbageCollection(t *testing.T) {
 
 	controller := storageversiongc.NewStorageVersionGC(kubeclient, leaseInformer, storageVersionInformer)
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	go leaseInformer.Informer().Run(stopCh)
-	go storageVersionInformer.Informer().Run(stopCh)
-	go controller.Run(stopCh)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go leaseInformer.Informer().Run(ctx.Done())
+	go storageVersionInformer.Informer().Run(ctx.Done())
+	go controller.Run(ctx)
 
 	createTestAPIServerIdentityLease(t, kubeclient, idA)
 	createTestAPIServerIdentityLease(t, kubeclient, idB)
@@ -211,7 +211,7 @@ func assertStorageVersionEntries(t *testing.T, client kubernetes.Interface,
 			return false, nil
 		}
 		if sv.Status.StorageVersions[0].APIServerID != firstID {
-			lastErr = fmt.Errorf("unexpected fisrt storage version entry id, expected %v, got: %v",
+			lastErr = fmt.Errorf("unexpected first storage version entry id, expected %v, got: %v",
 				firstID, sv.Status.StorageVersions[0].APIServerID)
 			return false, nil
 		}

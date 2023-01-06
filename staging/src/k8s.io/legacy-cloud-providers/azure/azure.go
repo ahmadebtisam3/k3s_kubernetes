@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -33,7 +34,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/klog/v2"
 	"k8s.io/legacy-cloud-providers/azure/auth"
 	azcache "k8s.io/legacy-cloud-providers/azure/cache"
@@ -92,12 +93,6 @@ const (
 
 	externalResourceGroupLabel = "kubernetes.azure.com/resource-group"
 	managedByAzureLabel        = "kubernetes.azure.com/managed"
-
-	// LabelFailureDomainBetaZone refer to https://github.com/kubernetes/api/blob/8519c5ea46199d57724725d5b969c5e8e0533692/core/v1/well_known_labels.go#L22-L23
-	LabelFailureDomainBetaZone = "failure-domain.beta.kubernetes.io/zone"
-
-	// LabelFailureDomainBetaRegion failure-domain region label
-	LabelFailureDomainBetaRegion = "failure-domain.beta.kubernetes.io/region"
 )
 
 const (
@@ -274,6 +269,8 @@ type Cloud struct {
 	ipv6DualStackEnabled bool
 	// Lock for access to node caches, includes nodeZones, nodeResourceGroups, and unmanagedNodes.
 	nodeCachesLock sync.RWMutex
+	// nodeNames holds current nodes for tracking added nodes in VM caches.
+	nodeNames sets.String
 	// nodeZones is a mapping from Zone to a sets.String of Node's names in the Zone
 	// it is updated by the nodeInformer
 	nodeZones map[string]sets.String
@@ -281,6 +278,8 @@ type Cloud struct {
 	nodeResourceGroups map[string]string
 	// unmanagedNodes holds a list of nodes not managed by Azure cloud provider.
 	unmanagedNodes sets.String
+	// excludeLoadBalancerNodes holds a list of nodes that should be excluded from LoadBalancer.
+	excludeLoadBalancerNodes sets.String
 	// nodeInformerSynced is for determining if the informer has synced.
 	nodeInformerSynced cache.InformerSynced
 
@@ -328,7 +327,7 @@ func NewCloud(configReader io.Reader) (cloudprovider.Interface, error) {
 	if err != nil {
 		return nil, err
 	}
-	az.ipv6DualStackEnabled = utilfeature.DefaultFeatureGate.Enabled(IPv6DualStack)
+	az.ipv6DualStackEnabled = true
 
 	return az, nil
 }
@@ -342,10 +341,12 @@ func NewCloudWithoutFeatureGates(configReader io.Reader) (*Cloud, error) {
 	}
 
 	az := &Cloud{
-		nodeZones:          map[string]sets.String{},
-		nodeResourceGroups: map[string]string{},
-		unmanagedNodes:     sets.NewString(),
-		routeCIDRs:         map[string]string{},
+		nodeNames:                sets.NewString(),
+		nodeZones:                map[string]sets.String{},
+		nodeResourceGroups:       map[string]string{},
+		unmanagedNodes:           sets.NewString(),
+		excludeLoadBalancerNodes: sets.NewString(),
+		routeCIDRs:               map[string]string{},
 	}
 
 	err = az.InitializeCloudFromConfig(config, false)
@@ -479,7 +480,7 @@ func (az *Cloud) InitializeCloudFromConfig(config *Config, fromSecret bool) erro
 	az.Config = *config
 	az.Environment = *env
 	az.ResourceRequestBackoff = resourceRequestBackoff
-	az.metadata, err = NewInstanceMetadataService(metadataURL)
+	az.metadata, err = NewInstanceMetadataService(imdsServer)
 	if err != nil {
 		return err
 	}
@@ -748,10 +749,6 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 		UpdateFunc: func(prev, obj interface{}) {
 			prevNode := prev.(*v1.Node)
 			newNode := obj.(*v1.Node)
-			if newNode.Labels[LabelFailureDomainBetaZone] ==
-				prevNode.Labels[LabelFailureDomainBetaZone] {
-				return
-			}
 			az.updateNodeCaches(prevNode, newNode)
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -782,9 +779,23 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
 	defer az.nodeCachesLock.Unlock()
 
 	if prevNode != nil {
-		// Remove from nodeZones cache.
-		prevZone, ok := prevNode.ObjectMeta.Labels[LabelFailureDomainBetaZone]
+
+		// Remove from nodeNames cache.
+		az.nodeNames.Delete(prevNode.ObjectMeta.Name)
+
+		// Remove from nodeZones cache
+		prevZone, ok := prevNode.ObjectMeta.Labels[v1.LabelTopologyZone]
+
 		if ok && az.isAvailabilityZone(prevZone) {
+			az.nodeZones[prevZone].Delete(prevNode.ObjectMeta.Name)
+			if az.nodeZones[prevZone].Len() == 0 {
+				az.nodeZones[prevZone] = nil
+			}
+		}
+
+		// Remove from nodeZones cache if using deprecated LabelFailureDomainBetaZone
+		prevZoneFailureDomain, ok := prevNode.ObjectMeta.Labels[v1.LabelFailureDomainBetaZone]
+		if ok && az.isAvailabilityZone(prevZoneFailureDomain) {
 			az.nodeZones[prevZone].Delete(prevNode.ObjectMeta.Name)
 			if az.nodeZones[prevZone].Len() == 0 {
 				az.nodeZones[prevZone] = nil
@@ -797,16 +808,26 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
 			delete(az.nodeResourceGroups, prevNode.ObjectMeta.Name)
 		}
 
-		// Remove from unmanagedNodes cache.
 		managed, ok := prevNode.ObjectMeta.Labels[managedByAzureLabel]
-		if ok && managed == "false" {
+		isNodeManagedByCloudProvider := !ok || managed != "false"
+
+		// Remove from unmanagedNodes cache
+		if !isNodeManagedByCloudProvider {
 			az.unmanagedNodes.Delete(prevNode.ObjectMeta.Name)
+		}
+
+		// if the node is being deleted from the cluster, exclude it from load balancers
+		if newNode == nil {
+			az.excludeLoadBalancerNodes.Insert(prevNode.ObjectMeta.Name)
 		}
 	}
 
 	if newNode != nil {
+		// Add to nodeNames cache.
+		az.nodeNames.Insert(newNode.ObjectMeta.Name)
+
 		// Add to nodeZones cache.
-		newZone, ok := newNode.ObjectMeta.Labels[LabelFailureDomainBetaZone]
+		newZone, ok := newNode.ObjectMeta.Labels[v1.LabelTopologyZone]
 		if ok && az.isAvailabilityZone(newZone) {
 			if az.nodeZones[newZone] == nil {
 				az.nodeZones[newZone] = sets.NewString()
@@ -820,10 +841,35 @@ func (az *Cloud) updateNodeCaches(prevNode, newNode *v1.Node) {
 			az.nodeResourceGroups[newNode.ObjectMeta.Name] = strings.ToLower(newRG)
 		}
 
-		// Add to unmanagedNodes cache.
+		_, hasExcludeBalancerLabel := newNode.ObjectMeta.Labels[v1.LabelNodeExcludeBalancers]
 		managed, ok := newNode.ObjectMeta.Labels[managedByAzureLabel]
-		if ok && managed == "false" {
+		isNodeManagedByCloudProvider := !ok || managed != "false"
+
+		// Update unmanagedNodes cache
+		if !isNodeManagedByCloudProvider {
 			az.unmanagedNodes.Insert(newNode.ObjectMeta.Name)
+		}
+
+		// Update excludeLoadBalancerNodes cache
+		switch {
+		case !isNodeManagedByCloudProvider:
+			az.excludeLoadBalancerNodes.Insert(newNode.ObjectMeta.Name)
+
+		case hasExcludeBalancerLabel:
+			az.excludeLoadBalancerNodes.Insert(newNode.ObjectMeta.Name)
+
+		case !isNodeReady(newNode) && getCloudTaint(newNode.Spec.Taints) == nil:
+			// If not in ready state and not a newly created node, add to excludeLoadBalancerNodes cache.
+			// New nodes (tainted with "node.cloudprovider.kubernetes.io/uninitialized") should not be
+			// excluded from load balancers regardless of their state, so as to reduce the number of
+			// VMSS API calls and not provoke VMScaleSetActiveModelsCountLimitReached.
+			// (https://github.com/kubernetes-sigs/cloud-provider-azure/issues/851)
+			az.excludeLoadBalancerNodes.Insert(newNode.ObjectMeta.Name)
+
+		default:
+			// Nodes not falling into the three cases above are valid backends and
+			// should not appear in excludeLoadBalancerNodes cache.
+			az.excludeLoadBalancerNodes.Delete(newNode.ObjectMeta.Name)
 		}
 	}
 }
@@ -876,6 +922,22 @@ func (az *Cloud) GetNodeResourceGroup(nodeName string) (string, error) {
 	return az.ResourceGroup, nil
 }
 
+// GetNodeNames returns a set of all node names in the k8s cluster.
+func (az *Cloud) GetNodeNames() (sets.String, error) {
+	// Kubelet won't set az.nodeInformerSynced, return nil.
+	if az.nodeInformerSynced == nil {
+		return nil, nil
+	}
+
+	az.nodeCachesLock.RLock()
+	defer az.nodeCachesLock.RUnlock()
+	if !az.nodeInformerSynced() {
+		return nil, fmt.Errorf("node informer is not synced when trying to GetNodeNames")
+	}
+
+	return sets.NewString(az.nodeNames.List()...), nil
+}
+
 // GetResourceGroups returns a set of resource groups that all nodes are running on.
 func (az *Cloud) GetResourceGroups() (sets.String, error) {
 	// Kubelet won't set az.nodeInformerSynced, always return configured resourceGroup.
@@ -913,16 +975,41 @@ func (az *Cloud) GetUnmanagedNodes() (sets.String, error) {
 	return sets.NewString(az.unmanagedNodes.List()...), nil
 }
 
-// ShouldNodeExcludedFromLoadBalancer returns true if node is unmanaged or in external resource group.
-func (az *Cloud) ShouldNodeExcludedFromLoadBalancer(node *v1.Node) bool {
-	labels := node.ObjectMeta.Labels
-	if rg, ok := labels[externalResourceGroupLabel]; ok && !strings.EqualFold(rg, az.ResourceGroup) {
-		return true
+// ShouldNodeExcludedFromLoadBalancer returns true if node is unmanaged, in external resource group or labeled with "node.kubernetes.io/exclude-from-external-load-balancers".
+func (az *Cloud) ShouldNodeExcludedFromLoadBalancer(nodeName string) (bool, error) {
+	// Kubelet won't set az.nodeInformerSynced, always return nil.
+	if az.nodeInformerSynced == nil {
+		return false, nil
 	}
 
-	if managed, ok := labels[managedByAzureLabel]; ok && managed == "false" {
-		return true
+	az.nodeCachesLock.RLock()
+	defer az.nodeCachesLock.RUnlock()
+	if !az.nodeInformerSynced() {
+		return false, fmt.Errorf("node informer is not synced when trying to fetch node caches")
 	}
 
+	// Return true if the node is in external resource group.
+	if cachedRG, ok := az.nodeResourceGroups[nodeName]; ok && !strings.EqualFold(cachedRG, az.ResourceGroup) {
+		return true, nil
+	}
+
+	return az.excludeLoadBalancerNodes.Has(nodeName), nil
+}
+
+func isNodeReady(node *v1.Node) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == v1.NodeReady && cond.Status == v1.ConditionTrue {
+			return true
+		}
+	}
 	return false
+}
+
+func getCloudTaint(taints []v1.Taint) *v1.Taint {
+	for _, taint := range taints {
+		if taint.Key == cloudproviderapi.TaintExternalCloudProvider {
+			return &taint
+		}
+	}
+	return nil
 }

@@ -39,6 +39,10 @@ func (m *mockAffinityStore) GetAffinity(podUID string, containerName string) top
 	return m.hint
 }
 
+func (m *mockAffinityStore) GetPolicy() topologymanager.Policy {
+	return nil
+}
+
 func makeNUMADevice(id string, numa int) pluginapi.Device {
 	return pluginapi.Device{
 		ID:       id,
@@ -56,7 +60,7 @@ func TestGetTopologyHints(t *testing.T) {
 
 	for _, tc := range tcases {
 		m := ManagerImpl{
-			allDevices:       make(map[string]map[string]pluginapi.Device),
+			allDevices:       NewResourceDeviceInstances(),
 			healthyDevices:   make(map[string]sets.String),
 			allocatedDevices: make(map[string]sets.String),
 			podDevices:       newPodDevices(),
@@ -66,7 +70,7 @@ func TestGetTopologyHints(t *testing.T) {
 		}
 
 		for r := range tc.devices {
-			m.allDevices[r] = make(map[string]pluginapi.Device)
+			m.allDevices[r] = make(DeviceInstances)
 			m.healthyDevices[r] = sets.NewString()
 
 			for _, d := range tc.devices[r] {
@@ -409,7 +413,7 @@ func TestTopologyAlignedAllocation(t *testing.T) {
 	}
 	for _, tc := range tcases {
 		m := ManagerImpl{
-			allDevices:            make(map[string]map[string]pluginapi.Device),
+			allDevices:            NewResourceDeviceInstances(),
 			healthyDevices:        make(map[string]sets.String),
 			allocatedDevices:      make(map[string]sets.String),
 			endpoints:             make(map[string]endpointInfo),
@@ -419,7 +423,7 @@ func TestTopologyAlignedAllocation(t *testing.T) {
 			topologyAffinityStore: &mockAffinityStore{tc.hint},
 		}
 
-		m.allDevices[tc.resource] = make(map[string]pluginapi.Device)
+		m.allDevices[tc.resource] = make(DeviceInstances)
 		m.healthyDevices[tc.resource] = sets.NewString()
 		m.endpoints[tc.resource] = endpointInfo{}
 
@@ -598,7 +602,7 @@ func TestGetPreferredAllocationParameters(t *testing.T) {
 	}
 	for _, tc := range tcases {
 		m := ManagerImpl{
-			allDevices:            make(map[string]map[string]pluginapi.Device),
+			allDevices:            NewResourceDeviceInstances(),
 			healthyDevices:        make(map[string]sets.String),
 			allocatedDevices:      make(map[string]sets.String),
 			endpoints:             make(map[string]endpointInfo),
@@ -608,7 +612,7 @@ func TestGetPreferredAllocationParameters(t *testing.T) {
 			topologyAffinityStore: &mockAffinityStore{tc.hint},
 		}
 
-		m.allDevices[tc.resource] = make(map[string]pluginapi.Device)
+		m.allDevices[tc.resource] = make(DeviceInstances)
 		m.healthyDevices[tc.resource] = sets.NewString()
 		for _, d := range tc.allDevices {
 			m.allDevices[tc.resource][d.ID] = d
@@ -920,7 +924,7 @@ func TestGetPodTopologyHints(t *testing.T) {
 
 	for _, tc := range tcases {
 		m := ManagerImpl{
-			allDevices:       make(map[string]map[string]pluginapi.Device),
+			allDevices:       NewResourceDeviceInstances(),
 			healthyDevices:   make(map[string]sets.String),
 			allocatedDevices: make(map[string]sets.String),
 			podDevices:       newPodDevices(),
@@ -930,7 +934,7 @@ func TestGetPodTopologyHints(t *testing.T) {
 		}
 
 		for r := range tc.devices {
-			m.allDevices[r] = make(map[string]pluginapi.Device)
+			m.allDevices[r] = make(DeviceInstances)
 			m.healthyDevices[r] = sets.NewString()
 
 			for _, d := range tc.devices[r] {
